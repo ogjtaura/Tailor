@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verified Output Object",
+  "type": "object",
+  "required": [
+    "object_id",
+    "text",
+    "claims"
+  ],
+  "properties": {
+    "object_id": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "word_limit": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "claim_id",
+          "text",
+          "fact_ids",
+          "ownership",
+          "state"
+        ],
+        "properties": {
+          "claim_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "fact_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requirement_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ownership": {
+            "enum": [
+              "individual",
+              "team",
+              "organisation",
+              "non_factual"
+            ]
+          },
+          "state": {
+            "enum": [
+              "completed",
+              "current",
+              "development_result",
+              "planned",
+              "pending_verification",
+              "non_factual"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,78 @@
+[
+  {
+    "case": "supported team result",
+    "output": {
+      "object_id": "B1",
+      "text": "Our team achieved an approximately 7.8-second development solve.",
+      "claims": [
+        {
+          "claim_id": "C1",
+          "text": "Our team achieved an approximately 7.8-second development solve.",
+          "fact_ids": [
+            "FACT-GWR-TEAM-7_8"
+          ],
+          "ownership": "team",
+          "state": "development_result"
+        }
+      ]
+    },
+    "should_pass": true
+  },
+  {
+    "case": "team to individual inflation",
+    "output": {
+      "object_id": "B2",
+      "text": "I achieved a 7.8-second development solve.",
+      "claims": [
+        {
+          "claim_id": "C2",
+          "text": "I achieved a 7.8-second development solve.",
+          "fact_ids": [
+            "FACT-GWR-TEAM-7_8"
+          ],
+          "ownership": "individual",
+          "state": "development_result"
+        }
+      ]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "pending record represented as completed",
+    "output": {
+      "object_id": "B3",
+      "text": "Guinness World Record holder.",
+      "claims": [
+        {
+          "claim_id": "C3",
+          "text": "Guinness World Record holder.",
+          "fact_ids": [
+            "FACT-GWR-ATTEMPT"
+          ],
+          "ownership": "team",
+          "state": "completed"
+        }
+      ]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "numeric drift from user-confirmed result",
+    "output": {
+      "object_id": "B4",
+      "text": "Configured the system to achieve 30 ms per 90\u00b0 rotation.",
+      "claims": [
+        {
+          "claim_id": "C4",
+          "text": "Configured the system to achieve 30 ms per 90\u00b0 rotation.",
+          "fact_ids": [
+            "FACT-ROTATION-28MS"
+          ],
+          "ownership": "individual",
+          "state": "completed"
+        }
+      ]
+    },
+    "should_pass": false
+  }
+]

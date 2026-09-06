@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Job Requirement Bank",
+  "type": "object",
+  "required": [
+    "job_id",
+    "requirements"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string"
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "requirement_id",
+          "text",
+          "priority"
+        ],
+        "properties": {
+          "requirement_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "priority": {
+            "enum": [
+              "hard",
+              "important",
+              "preferred"
+            ]
+          },
+          "source_excerpt": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

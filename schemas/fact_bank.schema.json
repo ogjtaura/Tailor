@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Applicant Fact Bank",
+  "type": "object",
+  "required": [
+    "applicant_id",
+    "sources",
+    "protected_fields",
+    "facts"
+  ],
+  "properties": {
+    "applicant_id": {
+      "type": "string"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "source_id",
+          "source_type"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string"
+          },
+          "source_type": {
+            "enum": [
+              "document",
+              "user_confirmation",
+              "form",
+              "other"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "protected_fields": {
+      "type": "object"
+    },
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "fact_id",
+          "source_ids",
+          "value",
+          "ownership",
+          "state"
+        ],
+        "properties": {
+          "fact_id": {
+            "type": "string"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "category": {
+            "type": "string"
+          },
+          "value": {},
+          "text": {
+            "type": "string"
+          },
+          "ownership": {
+            "enum": [
+              "individual",
+              "team",
+              "organisation"
+            ]
+          },
+          "state": {
+            "enum": [
+              "completed",
+              "current",
+              "development_result",
+              "planned",
+              "pending_verification"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
