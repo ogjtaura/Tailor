@@ -2,11 +2,17 @@
 
 Runs ``codex exec --sandbox read-only``; it never writes production code.
 
-Key contract (plan amendment 9): a *schema-valid* verdict of ``fail`` means the
-application code may need repair. Any *infrastructure* failure - timeout,
-non-zero exit, missing output file, malformed JSON, schema-invalid body - is
-NOT an application failure and is returned as ``kind="infra_error"``. The graph
-never routes an infra error to the Claude repair worker.
+Contract:
+
+* A *schema- and semantically-valid* verdict of ``fail`` means the application
+  code may need repair.
+* Any *infrastructure* failure - timeout, non-zero exit, missing output file,
+  malformed JSON, schema-invalid body, or a body that breaks the local semantic
+  invariants - is returned as ``kind="infra_error"`` and is NEVER routed to the
+  Claude repair worker.
+
+Reviewer output is untrusted input: the CLI ``--output-schema`` is defence in
+depth only; the local Pydantic models below are the real validation layer.
 """
 
 from __future__ import annotations
@@ -17,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from agent_harness.config import Config, resolve_codex_executable
 from agent_harness.promptlib import render
@@ -25,8 +31,11 @@ from agent_harness.workers.base import WorkerResult, run_subprocess
 
 _VERDICT_SCHEMA = Path(__file__).parent.parent / "schemas" / "review_verdict.schema.json"
 
+_BLOCKING_SEVERITIES = {"major", "critical"}
+
 
 class ReviewFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     id: str
     description: str = ""
     evidence: str = ""
@@ -34,9 +43,25 @@ class ReviewFinding(BaseModel):
 
 
 class ReviewVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     verdict: Literal["pass", "fail"]
     severity: Literal["none", "minor", "major", "critical"] = "none"
     findings: list[ReviewFinding] = []
+
+    @model_validator(mode="after")
+    def _semantic_invariants(self) -> "ReviewVerdict":
+        if self.verdict == "pass":
+            if self.severity in _BLOCKING_SEVERITIES:
+                raise ValueError(
+                    f"verdict=pass cannot carry blocking severity {self.severity!r}"
+                )
+        else:  # fail
+            if not self.findings:
+                raise ValueError("verdict=fail must include at least one finding")
+            if self.severity == "none":
+                raise ValueError("verdict=fail must have a non-'none' severity")
+        return self
 
 
 @dataclass
@@ -50,6 +75,20 @@ class ReviewOutcome:
     @property
     def is_infra_error(self) -> bool:
         return self.kind == "infra_error"
+
+    @property
+    def is_usage_limit(self) -> bool:
+        return self.classification == "usage_limit"
+
+
+@dataclass
+class EscalateOutcome:
+    root_cause: Optional[str]
+    classification: str = "ok"
+
+    @property
+    def is_usage_limit(self) -> bool:
+        return self.classification == "usage_limit"
 
 
 class CodexWorker:
@@ -118,7 +157,7 @@ class CodexWorker:
         except ValidationError as exc:
             return ReviewOutcome(
                 kind="infra_error",
-                reason=f"reviewer output did not match verdict schema: {exc}",
+                reason=f"reviewer output failed schema/semantic validation: {exc}",
                 classification="cli_error",
                 result=res,
             )
@@ -126,7 +165,7 @@ class CodexWorker:
 
     # -- escalation review (root-cause analysis) --------------------------
 
-    def escalate(self, *, diff: str, failures: str, iteration: int = 0) -> Optional[str]:
+    def escalate(self, *, diff: str, failures: str, iteration: int = 0) -> EscalateOutcome:
         prompt = render("escalation_reviewer", diff=diff, failures=failures)
         argv = [
             self._executable, "exec",
@@ -144,8 +183,8 @@ class CodexWorker:
             usage_limit_patterns=self.config.classify.usage_limit_patterns,
         )
         if not res.ok:
-            return None  # non-fatal: repair proceeds without a root-cause hint
-        return res.stdout.strip() or None
+            return EscalateOutcome(root_cause=None, classification=res.classification)
+        return EscalateOutcome(root_cause=res.stdout.strip() or None)
 
     # -- internals --------------------------------------------------------
 

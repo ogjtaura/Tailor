@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def _utcnow() -> str:
@@ -37,12 +37,19 @@ class StopReason(str, Enum):
     SUCCESS = "SUCCESS"
     ITERATION_LIMIT = "ITERATION_LIMIT"
     REPAIR_LIMIT = "REPAIR_LIMIT"
+    NO_PROGRESS = "NO_PROGRESS"
     STAGNATION_UNRESOLVED = "STAGNATION_UNRESOLVED"
     PLANNING_FAILED = "PLANNING_FAILED"
     REVIEWER_ERROR = "REVIEWER_ERROR"
+    REVIEW_COVERAGE_GAP = "REVIEW_COVERAGE_GAP"
     PROTECTED_PATH_MODIFIED = "PROTECTED_PATH_MODIFIED"
     DIRTY_WORKTREE = "DIRTY_WORKTREE"
     UNEXPECTED_WORKTREE_STATE = "UNEXPECTED_WORKTREE_STATE"
+    EXPECTED_HEAD_MOVED = "EXPECTED_HEAD_MOVED"
+    DETACHED_HEAD = "DETACHED_HEAD"
+    CONFIG_INVALID = "CONFIG_INVALID"
+    UNSAFE_RESUME_STATE = "UNSAFE_RESUME_STATE"
+    STATE_CORRUPT = "STATE_CORRUPT"
     CLI_FATAL = "CLI_FATAL"
     USAGE_LIMIT = "USAGE_LIMIT"
     USER_ABORT = "USER_ABORT"
@@ -57,6 +64,14 @@ WorkerInFlight = Literal[
 ]
 
 WRITE_CAPABLE_WORKERS: frozenset[str] = frozenset({"claude_implement", "claude_repair"})
+
+# Nodes that a persisted ``next_node`` is allowed to name. Any other value on
+# resume is treated as an unsafe state.
+RESUMABLE_NODES: frozenset[str] = frozenset(
+    {"plan", "implement", "verify", "review", "decide", "repair", "escalation_review", "checkpoint", "end"}
+)
+
+CheckpointStatus = Literal["none", "intended", "committed"]
 
 
 class CheckResult(BaseModel):
@@ -79,6 +94,8 @@ class Finding(BaseModel):
 
 
 class HarnessState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     objective: str
     run_id: str
     started_at: str = Field(default_factory=_utcnow)
@@ -90,17 +107,19 @@ class HarnessState(BaseModel):
     completed_tasks: list[str] = Field(default_factory=list)
 
     # loop counters
-    iteration: int = 0                     # ++ when an implement OR repair worker starts
-    repair_attempts: int = 0              # per current task; reset on new task / checkpoint
+    iteration: int = 0                    # ++ when an implement OR repair worker starts
+    repair_attempts: int = 0             # per current task; reset on new task / checkpoint
+    no_progress_count: int = 0           # writer iterations that produced no attributable change
 
     # verification
     check_results: list[CheckResult] = Field(default_factory=list)
     checks_passed: Optional[bool] = None
 
-    # review — schema-valid verdict only
+    # review — schema-valid + semantically-valid verdict only
     review_status: Optional[Literal["pending", "pass", "fail"]] = None
     review_severity: Optional[Literal["none", "minor", "major", "critical"]] = None
     review_findings: list[Finding] = Field(default_factory=list)
+    reviewed_paths: list[str] = Field(default_factory=list)
     # review — infrastructure failure (never routed to Claude repair)
     review_error: Optional[str] = None
     review_error_retries: int = 0
@@ -110,10 +129,21 @@ class HarnessState(BaseModel):
     stagnant_iterations: int = 0
     last_failure_fingerprint: Optional[str] = None
     repeated_failure_count: int = 0
+    stagnation_escalated: bool = False
 
-    # worktree provenance
-    baseline_head: Optional[str] = None
-    harness_touched_files: list[str] = Field(default_factory=list)
+    # worktree provenance / git ownership
+    baseline_head: Optional[str] = None   # HEAD at fresh bootstrap (immutable)
+    expected_head: Optional[str] = None   # moves forward with each harness commit
+    owned_paths: list[str] = Field(default_factory=list)  # this task's attributable changes
+    pre_writer_paths: list[str] = Field(default_factory=list)
+    pre_writer_hashes: dict[str, Optional[str]] = Field(default_factory=dict)
+
+    # checkpoint intent (crash-safe, idempotent commit)
+    checkpoint_status: CheckpointStatus = "none"
+    checkpoint_task: Optional[str] = None
+    checkpoint_paths: list[str] = Field(default_factory=list)
+    checkpoint_pre_head: Optional[str] = None
+    checkpoint_result_head: Optional[str] = None
 
     # escalation
     root_cause: Optional[str] = None
@@ -133,9 +163,8 @@ class HarnessState(BaseModel):
     def touch(self) -> None:
         self.updated_at = _utcnow()
 
-    def record_touched(self, paths: list[str]) -> None:
-        merged = set(self.harness_touched_files) | set(paths)
-        self.harness_touched_files = sorted(merged)
+    def add_owned(self, paths) -> None:
+        self.owned_paths = sorted(set(self.owned_paths) | set(paths))
 
     def failing_checks(self) -> list[CheckResult]:
         return [c for c in self.check_results if not c.passed]
@@ -153,12 +182,8 @@ def _norm_lines(text: str, n: int = 5) -> str:
 
 
 def failure_fingerprint(state: HarnessState) -> str:
-    """Stable hash of *what* is currently failing.
-
-    Combines the sorted set of failing check commands, the first few normalised
-    lines of each failing stream, and the sorted review finding ids. Used to
-    detect stagnation (same failure surviving repeated repair attempts).
-    """
+    """Stable hash of *what* is currently failing (failing check commands +
+    first normalised lines of their output + sorted review finding ids)."""
     parts: list[str] = []
     for chk in sorted(state.failing_checks(), key=lambda c: c.command):
         parts.append("CMD " + chk.command)
@@ -170,19 +195,15 @@ def failure_fingerprint(state: HarnessState) -> str:
 
 
 def update_stagnation(state: HarnessState, *, new_diff_hash: Optional[str]) -> None:
-    """Recompute stagnation counters after a verify pass.
-
-    Call this from the ``verify`` node with the freshly computed working-tree
-    diff hash, BEFORE writing it onto the state. Stagnation accrues only while
-    something is still failing, the failure fingerprint is unchanged, and the
-    diff has not moved - i.e. repair attempts are not making a difference.
-    """
+    """Recompute stagnation counters after a verify pass. Call BEFORE writing
+    ``new_diff_hash`` onto the state elsewhere."""
     fp = failure_fingerprint(state)
     still_failing = bool(state.failing_checks()) or state.review_status == "fail"
 
     if not still_failing:
         state.repeated_failure_count = 0
         state.stagnant_iterations = 0
+        state.stagnation_escalated = False
         state.last_failure_fingerprint = fp
         state.last_diff_hash = new_diff_hash
         return
@@ -195,6 +216,7 @@ def update_stagnation(state: HarnessState, *, new_diff_hash: Optional[str]) -> N
     else:
         state.repeated_failure_count = 1
         state.stagnant_iterations = 0
+        state.stagnation_escalated = False  # progress was made; reset the escalation latch
 
     state.last_failure_fingerprint = fp
     state.last_diff_hash = new_diff_hash

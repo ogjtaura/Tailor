@@ -1,8 +1,9 @@
 """The LangGraph orchestration graph.
 
 The loop is expressed entirely in graph edges - nodes never recurse into
-themselves. ``decide`` is the single router; every other transition is either
-unconditional or a thin "stop if a fatal condition was set, else continue" gate.
+themselves. ``decide`` is the single router; every routing decision (and any
+stop reason it implies) is made in the ``decide`` NODE, because LangGraph does
+not persist mutations made inside conditional-edge functions.
 
     START -> bootstrap -> plan -> implement -> verify -> decide -> ...
              repair / escalation_review / review / checkpoint hang off decide
@@ -10,14 +11,13 @@ unconditional or a thin "stop if a fatal condition was set, else continue" gate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from langgraph.graph import END, START, StateGraph
 
 from agent_harness.config import Config
-from agent_harness.git_tools import GitError, GitTools
+from agent_harness.git_tools import GitError, GitTools, WorktreeSnapshot
 from agent_harness.persistence import Persistence
 from agent_harness import verifier
 from agent_harness.state import (
@@ -25,11 +25,10 @@ from agent_harness.state import (
     HarnessState,
     Status,
     StopReason,
-    failure_fingerprint,
     is_stagnant,
     update_stagnation,
 )
-from agent_harness.workers.claude import ClaudeWorker, PlanningError
+from agent_harness.workers.claude import ClaudeWorker, PlanningError, WorkerUsageLimitError
 from agent_harness.workers.codex import CodexWorker
 
 NODE_LABELS = {
@@ -43,6 +42,24 @@ NODE_LABELS = {
     "escalation_review": "ESCALATION",
     "checkpoint": "CHECKPOINT",
 }
+
+
+def recursion_budget(config: Config) -> int:
+    """A LangGraph recursion limit that can never undercut the harness's own
+    logical limits. Derived from the configured maxima, then generously padded -
+    over-provisioning is harmless (our stop reasons fire first); under-
+    provisioning raises GraphRecursionError, which must never happen.
+
+    Per writer iteration, worst case:
+      writer + verify + decide                          = 3
+      (review + decide) x (review_retries + 1)          = 2*(r+1)
+      escalation_review + repair + verify + decide      = 4   (stagnation cycle)
+    Plus plan + checkpoint per task, and tasks <= max_iterations.
+    """
+    a = config.agent
+    r = max(0, config.codex.review_retries)
+    per_iteration = 3 + 2 * (r + 1) + 4
+    return 100 + a.max_iterations * (per_iteration + 4)
 
 
 class Printer:
@@ -73,15 +90,6 @@ class Printer:
         self._emit(msg)
 
 
-@dataclass
-class EngineDeps:
-    claude: ClaudeWorker
-    codex: CodexWorker
-    git: GitTools
-    store: Persistence
-    printer: Printer
-
-
 class Engine:
     """Builds and runs the harness graph with injectable collaborators."""
 
@@ -108,25 +116,15 @@ class Engine:
 
     def build(self):
         g = StateGraph(HarnessState)
-        g.add_node("bootstrap", self.bootstrap)
-        g.add_node("plan", self.plan)
-        g.add_node("implement", self.implement)
-        g.add_node("verify", self.verify)
-        g.add_node("review", self.review)
-        g.add_node("decide", self.decide)
-        g.add_node("repair", self.repair)
-        g.add_node("escalation_review", self.escalation_review)
-        g.add_node("checkpoint", self.checkpoint)
+        for name in ("bootstrap", "plan", "implement", "verify", "review",
+                     "decide", "repair", "escalation_review", "checkpoint"):
+            g.add_node(name, getattr(self, name))
 
         g.add_edge(START, "bootstrap")
         resume_map = {
-            "plan": "plan",
-            "implement": "implement",
-            "verify": "verify",
-            "review": "review",
-            "repair": "repair",
-            "decide": "decide",
-            "end": END,
+            "plan": "plan", "implement": "implement", "verify": "verify",
+            "review": "review", "repair": "repair", "decide": "decide",
+            "checkpoint": "checkpoint", "end": END,
         }
         g.add_conditional_edges("bootstrap", self._route_after_bootstrap, resume_map)
         g.add_conditional_edges("plan", self._gate("implement"), {"implement": "implement", "end": END})
@@ -155,18 +153,20 @@ class Engine:
 
     def run(self, state: HarnessState) -> HarnessState:
         app = self.build()
-        limit = max(50, self.config.agent.max_iterations * 8)
-        result = app.invoke(state, {"recursion_limit": limit})
-        final = result if isinstance(result, HarnessState) else HarnessState.model_validate(result)
+        limit = recursion_budget(self.config)
+        try:
+            result = app.invoke(state, {"recursion_limit": limit})
+            final = result if isinstance(result, HarnessState) else HarnessState.model_validate(result)
+        except Exception as exc:  # includes GraphRecursionError - must not leak
+            state.stop_reason = state.stop_reason or StopReason.CLI_FATAL
+            state.status = Status.STOPPED
+            self.printer.info(f"graph aborted: {type(exc).__name__}: {exc}")
+            self.store.save(state, note=f"graph aborted: {type(exc).__name__}")
+            return state
         self.store.save(final, note="run finished")
         return final
 
-    # -- routers ---------------------------------------------------------
-
-    # NOTE: LangGraph does not persist mutations made inside conditional-edge
-    # functions - only node return values are written back. Every routing
-    # decision (and any stop_reason it implies) is therefore made in a NODE;
-    # these functions only *read* the decision the node already recorded.
+    # -- routers (read-only; decisions are made in nodes) ------------------
 
     def _gate(self, default: str) -> Callable[[HarnessState], str]:
         def _router(state: HarnessState) -> str:
@@ -190,8 +190,8 @@ class Engine:
         return state.next_node or "end"
 
     def _decide_route(self, state: HarnessState) -> str:
-        """Pure-ish decision logic, called from the ``decide`` NODE so that any
-        ``stop_reason`` it sets is persisted. Returns an edge key."""
+        """Decision logic, called from the ``decide`` NODE so any stop_reason it
+        sets is persisted. Returns an edge key."""
         a = self.config.agent
         if state.stop_reason is not None:
             return "end"
@@ -208,10 +208,24 @@ class Engine:
                 state.stop_reason = StopReason.ITERATION_LIMIT
                 return "end"
             if is_stagnant(state, max_stagnant=a.max_stagnant_iterations):
+                if state.stagnation_escalated:
+                    state.stop_reason = StopReason.STAGNATION_UNRESOLVED
+                    return "end"
+                state.stagnation_escalated = True
                 return "escalate"
             return "repair"
 
         # Deterministic checks passed.
+        if not state.owned_paths:
+            # The writer produced nothing to commit - a no-op cannot be success.
+            if state.no_progress_count >= a.max_repairs_per_task:
+                state.stop_reason = StopReason.NO_PROGRESS
+                return "end"
+            if state.iteration >= a.max_iterations:
+                state.stop_reason = StopReason.ITERATION_LIMIT
+                return "end"
+            return "repair"
+
         if state.review_status in (None, "pending"):
             return "review"
         if state.review_status == "fail":
@@ -229,11 +243,19 @@ class Engine:
     def bootstrap(self, state: HarnessState) -> HarnessState:
         state.status = Status.BOOTSTRAP
         try:
+            self.config.require_runnable()
+        except Exception as exc:
+            state.stop_reason = StopReason.CONFIG_INVALID
+            self.printer.info(f"config rejected: {exc}")
+            return state
+        try:
             self.git.ensure_repo()
             if self.config.git.branch_required:
                 self.git.require_non_default_branch()
         except GitError as exc:
-            state.stop_reason = StopReason.CLI_FATAL
+            state.stop_reason = (
+                StopReason.DETACHED_HEAD if "detached" in str(exc).lower() else StopReason.CLI_FATAL
+            )
             self.printer.info(f"bootstrap failed: {exc}")
             return state
 
@@ -247,10 +269,12 @@ class Engine:
                 return state
             self.store.init_run(state)
             state.baseline_head = self.git.head()
+            state.expected_head = state.baseline_head
 
         log_dir = self.store.run_log_dir(state)
         self.claude.log_dir = Path(log_dir)
         self.codex.log_dir = Path(log_dir)
+        state.last_completed_node = "bootstrap"
         self.printer.transition("bootstrap", state, f"branch={self.git.current_branch()}")
         self.store.save(state, note="bootstrap ok")
         return state
@@ -266,6 +290,11 @@ class Engine:
                     repo_context=self._repo_context(),
                     iteration=state.iteration,
                 )
+            except WorkerUsageLimitError:
+                state.worker_in_flight = None
+                state.stop_reason = StopReason.USAGE_LIMIT
+                self.store.save(state, note="planner usage limit")
+                return state
             except PlanningError as exc:
                 state.worker_in_flight = None
                 state.stop_reason = StopReason.PLANNING_FAILED
@@ -277,7 +306,7 @@ class Engine:
 
         if state.current_task is None and state.remaining_tasks:
             state.current_task = state.remaining_tasks.pop(0)
-            state.repair_attempts = 0
+            self._reset_task_scoped(state)
 
         if state.current_task is None:
             state.stop_reason = StopReason.SUCCESS
@@ -291,31 +320,99 @@ class Engine:
         return state
 
     def implement(self, state: HarnessState) -> HarnessState:
-        state.status = Status.IMPLEMENTING
-        state.iteration += 1
-        state.worker_in_flight = "claude_implement"
-        self.store.save(state, note="implement in flight")
+        return self._write_worker(state, role="implement", worker_key="claude_implement")
 
-        inv = self.claude.implement(
-            objective=state.objective,
-            task=state.current_task or "",
-            repo_context=self._repo_context(),
-            iteration=state.iteration,
-        )
+    def repair(self, state: HarnessState) -> HarnessState:
+        state.repair_attempts += 1
+        return self._write_worker(state, role="repair", worker_key="claude_repair")
+
+    def _write_worker(self, state: HarnessState, *, role: str, worker_key: str) -> HarnessState:
+        state.status = Status.IMPLEMENTING
+
+        # HEAD must be where we left it before we hand control to a writer.
+        try:
+            if self.git.head() != state.expected_head:
+                state.stop_reason = StopReason.EXPECTED_HEAD_MOVED
+                self.printer.info("HEAD moved unexpectedly before a writer invocation")
+                self.store.save(state, note="expected head moved")
+                return state
+            before = self.git.snapshot()
+        except GitError as exc:
+            state.stop_reason = StopReason.CLI_FATAL
+            self.printer.info(f"git error before writer: {exc}")
+            return state
+
+        external = sorted(set(before.changed) - set(state.owned_paths))
+        if external:
+            state.stop_reason = StopReason.UNEXPECTED_WORKTREE_STATE
+            self.printer.info(f"unrelated pre-existing changes present: {external}")
+            self.store.save(state, note="unrelated changes before writer")
+            return state
+
+        state.iteration += 1
+        state.worker_in_flight = worker_key
+        state.pre_writer_paths = list(before.changed)
+        state.pre_writer_hashes = dict(before.hashes)
+        self.store.save(state, note=f"{role} in flight")
+
+        if role == "implement":
+            inv = self.claude.implement(
+                objective=state.objective, task=state.current_task or "",
+                repo_context=self._repo_context(), iteration=state.iteration,
+            )
+        else:
+            inv = self.claude.repair(
+                objective=state.objective, task=state.current_task or "",
+                failures=self._failure_brief(state), root_cause=state.root_cause or "",
+                iteration=state.iteration,
+            )
+            state.root_cause = None
+
         state.worker_in_flight = None
-        self._absorb_worker_changes(state, inv.result.classification, inv.result.timed_out, inv.result.exit_code)
-        state.last_completed_node = "implement"
-        self.printer.transition("implement", state, f"claude exit={inv.result.exit_code}")
-        self.store.save(state, note="implement done")
+
+        try:
+            after = self.git.snapshot()
+        except GitError:
+            after = WorktreeSnapshot()
+        attributable = self.git.attributable_changes(before, after)
+
+        hits = self.git.protected_hits(attributable, self.config.safety.protected_paths)
+        if hits:
+            state.stop_reason = StopReason.PROTECTED_PATH_MODIFIED
+            self.printer.info(f"worker modified protected paths: {hits}")
+            self.store.save(state, note="protected path modified")
+            return state
+
+        state.add_owned(attributable)
+        if attributable:
+            state.no_progress_count = 0
+        else:
+            state.no_progress_count += 1
+
+        cls = inv.result.classification
+        if cls == "usage_limit":
+            state.stop_reason = StopReason.USAGE_LIMIT
+        elif inv.result.timed_out or (inv.result.exit_code not in (0, None)):
+            state.stop_reason = StopReason.CLI_FATAL
+
+        state.last_completed_node = role
+        self.printer.transition(
+            role, state,
+            f"claude exit={inv.result.exit_code} attributable={len(attributable)} "
+            f"no_progress={state.no_progress_count}",
+        )
+        self.store.save(state, note=f"{role} done")
         return state
 
     def verify(self, state: HarnessState) -> HarnessState:
         state.status = Status.VERIFYING
-        # A fresh implementation/repair invalidates any prior review.
+        # a fresh implementation/repair invalidates any prior review
         state.review_status = None
         state.review_severity = None
         state.review_findings = []
         state.review_error = None
+        state.reviewed_paths = []
+
         results = verifier.run_checks(self.config.checks.commands, cwd=self.config.repo_root)
         state.check_results = results
         state.checks_passed = verifier.checks_passed(results)
@@ -333,8 +430,13 @@ class Engine:
         state.status = Status.REVIEWING
         state.worker_in_flight = "codex_review"
         self.store.save(state, note="review in flight")
+        try:
+            review_input = self.git.review_diff(state.owned_paths)
+        except GitError as exc:
+            review_input = ""
+            self.printer.info(f"could not build review diff: {exc}")
         outcome = self.codex.review(
-            diff=self._safe_diff(),
+            diff=review_input or "(no diff available)",
             check_results=verifier.summarise(state.check_results),
             iteration=state.iteration,
         )
@@ -344,6 +446,7 @@ class Engine:
             state.review_status = outcome.verdict.verdict
             state.review_severity = outcome.verdict.severity
             state.review_findings = [Finding(**f.model_dump()) for f in outcome.verdict.findings]
+            state.reviewed_paths = list(state.owned_paths)
             state.review_error = None
             detail = f"verdict={state.review_status} severity={state.review_severity}"
         else:
@@ -364,111 +467,164 @@ class Engine:
         state.status = Status.DECIDING
         route = self._decide_route(state)
         state.next_node = route
+        state.last_completed_node = "decide"
         self.printer.transition(
-            "decide",
-            state,
+            "decide", state,
             f"checks={state.checks_passed} review={state.review_status} "
             f"repairs={state.repair_attempts} stagnant={state.stagnant_iterations} -> {route}",
         )
         self.store.save(state, note=f"decide -> {route}")
         return state
 
-    def repair(self, state: HarnessState) -> HarnessState:
-        state.status = Status.IMPLEMENTING
-        state.iteration += 1
-        state.repair_attempts += 1
-        state.worker_in_flight = "claude_repair"
-        self.store.save(state, note="repair in flight")
-
-        inv = self.claude.repair(
-            objective=state.objective,
-            task=state.current_task or "",
-            failures=self._failure_brief(state),
-            root_cause=state.root_cause or "",
-            iteration=state.iteration,
-        )
-        state.worker_in_flight = None
-        state.root_cause = None
-        self._absorb_worker_changes(state, inv.result.classification, inv.result.timed_out, inv.result.exit_code)
-        state.last_completed_node = "repair"
-        self.printer.transition("repair", state, f"attempt={state.repair_attempts}")
-        self.store.save(state, note="repair done")
-        return state
-
     def escalation_review(self, state: HarnessState) -> HarnessState:
         state.status = Status.ESCALATING
         state.worker_in_flight = "codex_escalate"
         self.store.save(state, note="escalation in flight")
-        root_cause = self.codex.escalate(
-            diff=self._safe_diff(),
-            failures=self._failure_brief(state),
-            iteration=state.iteration,
+        try:
+            diff = self.git.review_diff(state.owned_paths) or self.git.diff()
+        except GitError:
+            diff = ""
+        outcome = self.codex.escalate(
+            diff=diff, failures=self._failure_brief(state), iteration=state.iteration
         )
         state.worker_in_flight = None
-        state.root_cause = root_cause
+        state.root_cause = outcome.root_cause
+        if outcome.classification == "usage_limit":
+            state.stop_reason = StopReason.USAGE_LIMIT
         state.last_completed_node = "escalation_review"
         self.printer.transition(
-            "escalation_review", state, "root-cause obtained" if root_cause else "no root-cause"
+            "escalation_review", state,
+            "root-cause obtained" if outcome.root_cause else f"no root-cause ({outcome.classification})",
         )
         self.store.save(state, note="escalation")
         return state
 
     def checkpoint(self, state: HarnessState) -> HarnessState:
         state.status = Status.CHECKPOINTING
+
+        # -- resume: a commit already succeeded, finish bookkeeping only ----
+        if state.checkpoint_status == "committed":
+            return self._finish_checkpoint(state)
+
+        # -- guards --------------------------------------------------------
         if not (state.checks_passed and state.review_status == "pass"):
             state.stop_reason = StopReason.CLI_FATAL
             self.printer.info("checkpoint reached without green checks+review; stopping")
             self.store.save(state, note="checkpoint guard tripped")
             return state
 
+        if not set(state.owned_paths).issubset(set(state.reviewed_paths)):
+            state.stop_reason = StopReason.REVIEW_COVERAGE_GAP
+            self.printer.info(
+                f"checkpoint would commit unreviewed paths: "
+                f"{sorted(set(state.owned_paths) - set(state.reviewed_paths))}"
+            )
+            self.store.save(state, note="review coverage gap")
+            return state
+
         try:
-            changed = self.git.changed_paths()
+            if self.git.is_detached():
+                state.stop_reason = StopReason.DETACHED_HEAD
+                self.store.save(state, note="detached head at checkpoint")
+                return state
+            self.git.require_non_default_branch()
+            head = self.git.head()
         except GitError as exc:
             state.stop_reason = StopReason.CLI_FATAL
             self.printer.info(f"checkpoint git error: {exc}")
             self.store.save(state, note="checkpoint git error")
             return state
 
-        unknown = sorted(set(changed) - set(state.harness_touched_files))
-        if unknown:
-            state.stop_reason = StopReason.UNEXPECTED_WORKTREE_STATE
-            self.printer.info(f"unexpected changes not attributable to the harness: {unknown}")
-            self.store.save(state, note="unexpected worktree state")
+        # -- resume: intent recorded, decide whether commit already happened
+        if state.checkpoint_status == "intended":
+            if head == state.checkpoint_pre_head:
+                pass  # safe to (re)try the commit below
+            elif self._looks_like_our_checkpoint(head, state):
+                state.checkpoint_result_head = head
+                state.checkpoint_status = "committed"
+                state.expected_head = head
+                if head not in state.commits:
+                    state.commits.append(head)
+                self.store.save(state, note="adopted pre-crash checkpoint commit")
+                return self._finish_checkpoint(state)
+            else:
+                state.stop_reason = StopReason.EXPECTED_HEAD_MOVED
+                self.printer.info("HEAD moved and does not match our checkpoint intent")
+                self.store.save(state, note="checkpoint head reconciliation failed")
+                return state
+        elif head != state.expected_head:
+            state.stop_reason = StopReason.EXPECTED_HEAD_MOVED
+            self.printer.info("HEAD moved unexpectedly before checkpoint")
+            self.store.save(state, note="expected head moved at checkpoint")
             return state
 
-        hits = self.git.protected_hits(changed, self.config.safety.protected_paths)
+        # -- attributable-content assertion -------------------------------
+        try:
+            changed_now = set(self.git.changed_paths())
+        except GitError as exc:
+            state.stop_reason = StopReason.CLI_FATAL
+            self.printer.info(f"checkpoint git error: {exc}")
+            return state
+        if not changed_now:
+            state.stop_reason = StopReason.NO_PROGRESS
+            self.printer.info("checkpoint: nothing changed in the worktree; not a completion")
+            self.store.save(state, note="checkpoint no-op")
+            return state
+        extra = sorted(changed_now - set(state.owned_paths))
+        if extra:
+            state.stop_reason = StopReason.UNEXPECTED_WORKTREE_STATE
+            self.printer.info(f"checkpoint: unowned changes present: {extra}")
+            self.store.save(state, note="unowned changes at checkpoint")
+            return state
+        hits = self.git.protected_hits(state.owned_paths, self.config.safety.protected_paths)
         if hits:
             state.stop_reason = StopReason.PROTECTED_PATH_MODIFIED
-            self.printer.info(f"protected paths modified: {hits}")
-            self.store.save(state, note="protected path modified")
+            self.store.save(state, note="protected path at checkpoint")
             return state
 
-        if self.config.git.auto_commit and changed:
-            msg = f"harness: {state.current_task} [iter {state.iteration}]"
-            try:
-                sha = self.git.checkpoint(
-                    msg, pathspec=changed, protected=self.config.safety.protected_paths
-                )
-                state.commits.append(sha)
-            except GitError as exc:
-                state.stop_reason = StopReason.CLI_FATAL
-                self.printer.info(f"checkpoint commit failed: {exc}")
-                self.store.save(state, note="checkpoint commit failed")
-                return state
+        # -- record intent, then commit ---------------------------------
+        state.checkpoint_status = "intended"
+        state.checkpoint_task = state.current_task
+        state.checkpoint_paths = sorted(state.owned_paths)
+        state.checkpoint_pre_head = head
+        state.checkpoint_result_head = None
+        self.store.save(state, note="checkpoint intent recorded")  # <-- crash boundary (pre-commit)
 
-        if state.current_task is not None:
-            state.completed_tasks.append(state.current_task)
-        state.current_task = None
-        state.repair_attempts = 0
-        state.review_error_retries = 0
-        state.stagnant_iterations = 0
-        state.repeated_failure_count = 0
-        state.last_failure_fingerprint = None
-        state.checks_passed = None
-        state.review_status = None
-        state.review_severity = None
-        state.review_findings = []
-        state.harness_touched_files = []
+        if not self.config.git.auto_commit:
+            state.checkpoint_status = "committed"  # completion without a commit
+            self.store.save(state, note="checkpoint (auto_commit off)")
+            return self._finish_checkpoint(state)
+
+        msg = f"harness: {state.current_task} [iter {state.iteration}] [run {state.run_id}]"
+        try:
+            sha = self.git.checkpoint(
+                msg, pathspec=state.checkpoint_paths, protected=self.config.safety.protected_paths
+            )
+        except GitError as exc:
+            state.stop_reason = StopReason.CLI_FATAL
+            self.printer.info(f"checkpoint commit failed: {exc}")
+            self.store.save(state, note="checkpoint commit failed")
+            return state
+        # <-- crash boundary (post-commit, pre-persist)
+        state.checkpoint_result_head = sha
+        state.checkpoint_status = "committed"
+        state.expected_head = sha
+        state.commits.append(sha)
+        self.store.save(state, note="checkpoint committed")
+        return self._finish_checkpoint(state)
+
+    def _finish_checkpoint(self, state: HarnessState) -> HarnessState:
+        task = state.checkpoint_task or state.current_task
+        if task and task not in state.completed_tasks:
+            state.completed_tasks.append(task)
+        if state.current_task == task:
+            state.current_task = None
+        self._reset_task_scoped(state)
+        state.checkpoint_status = "none"
+        state.checkpoint_task = None
+        state.checkpoint_paths = []
+        state.checkpoint_pre_head = None
+        state.checkpoint_result_head = None
         state.last_completed_node = "checkpoint"
 
         if not state.remaining_tasks:
@@ -479,37 +635,53 @@ class Engine:
             state.next_node = "plan"
 
         self.printer.transition(
-            "checkpoint",
-            state,
+            "checkpoint", state,
             f"commit={state.commits[-1][:9] if state.commits else 'none'} -> {state.next_node}",
         )
-        self.store.save(state, note="checkpoint")
+        self.store.save(state, note="checkpoint done")
         return state
 
     # -- helpers -------------------------------------------------------------
 
-    def _absorb_worker_changes(
-        self, state: HarnessState, classification: str, timed_out: bool, exit_code: Optional[int]
-    ) -> None:
-        try:
-            changed = self.git.changed_paths()
-        except GitError:
-            changed = []
-        state.record_touched(changed)
+    def _reset_task_scoped(self, state: HarnessState) -> None:
+        state.repair_attempts = 0
+        state.no_progress_count = 0
+        state.review_error_retries = 0
+        state.stagnant_iterations = 0
+        state.repeated_failure_count = 0
+        state.stagnation_escalated = False
+        state.last_failure_fingerprint = None
+        state.checks_passed = None
+        state.review_status = None
+        state.review_severity = None
+        state.review_findings = []
+        state.review_error = None
+        state.reviewed_paths = []
+        state.owned_paths = []
+        state.pre_writer_paths = []
+        state.pre_writer_hashes = {}
+        state.root_cause = None
 
-        hits = self.git.protected_hits(changed, self.config.safety.protected_paths)
-        if hits:
-            state.stop_reason = StopReason.PROTECTED_PATH_MODIFIED
-            self.printer.info(f"worker modified protected paths: {hits}")
-            return
-        if classification == "usage_limit":
-            state.stop_reason = StopReason.USAGE_LIMIT
-            return
-        if timed_out or (exit_code not in (0, None)):
-            state.stop_reason = StopReason.CLI_FATAL
+    def _looks_like_our_checkpoint(self, head: str, state: HarnessState) -> bool:
+        try:
+            parents = self.git.commit_parents(head)
+            msg = self.git.commit_message(head)
+        except GitError:
+            return False
+        return (
+            state.checkpoint_pre_head in parents
+            and f"[run {state.run_id}]" in msg
+            and "harness:" in msg
+        )
 
     def _failure_brief(self, state: HarnessState) -> str:
         lines: list[str] = []
+        if state.checks_passed and not state.owned_paths:
+            lines.append(
+                "- NO PROGRESS: the previous attempt produced no attributable "
+                "repository change. Actually implement the current task by editing "
+                "the files it requires."
+            )
         for chk in state.failing_checks():
             lines.append(f"- CHECK FAILED (exit {chk.exit_code}): {chk.command}")
             tail = (chk.stderr_tail or chk.stdout_tail).strip().splitlines()[-15:]
@@ -522,12 +694,6 @@ class Engine:
                 if f.suggested_fix:
                     lines.append(f"    suggested fix: {f.suggested_fix}")
         return "\n".join(lines) or "(no specific failure captured)"
-
-    def _safe_diff(self) -> str:
-        try:
-            return self.git.diff()
-        except GitError:
-            return ""
 
     def _repo_context(self) -> str:
         try:

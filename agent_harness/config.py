@@ -108,6 +108,17 @@ class Config(BaseModel):
             data["agent"]["max_iterations"] = max_iterations
         return Config(**data)
 
+    def require_runnable(self) -> None:
+        """Raise :class:`ConfigError` if the config cannot support an autonomous
+        run. A run with zero deterministic checks has no verification gate and is
+        rejected."""
+        real = [c for c in self.checks.commands if c and c.strip()]
+        if not real:
+            raise ConfigError(
+                "[checks] commands is empty: an autonomous run needs at least one "
+                "deterministic check (its exit code is the source of truth)."
+            )
+
 
 def _resolve_executable(configured: str, name: str, globs: list[str]) -> str:
     """config value -> PATH -> extension glob -> error."""

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from agent_harness.config import Config, detect_max_turns_support, resolve_claude_executable
 from agent_harness.promptlib import render
@@ -37,13 +37,19 @@ class PlanningError(RuntimeError):
     """Planner output was missing or did not match plan.schema.json."""
 
 
+class WorkerUsageLimitError(PlanningError):
+    """A worker call hit a subscription / usage-limit condition."""
+
+
 class PlanTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     id: str
     title: str
     rationale: str = ""
 
 
 class PlanResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     tasks: list[PlanTask]
 
 
@@ -126,6 +132,8 @@ class ClaudeWorker:
         ]
         argv += self._maybe_max_turns(self.config.claude.planner_max_turns)
         inv = self._run(argv, role="plan", iteration=iteration)
+        if inv.classification == "usage_limit":
+            raise WorkerUsageLimitError("planner hit a usage/rate limit")
         if not inv.ok:
             raise PlanningError(
                 f"planner CLI failed (exit={inv.result.exit_code}, "

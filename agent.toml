@@ -36,9 +36,10 @@ protected_paths = ["agent_harness/", "agent.toml", ".git/", ".agent/"]
 
 [checks]
 # Deterministic project checks. Exit code 0 == pass. A non-zero exit always
-# overrides any worker's claim of success.
+# overrides any worker's claim of success. An empty list is rejected for
+# autonomous runs (config.require_runnable).
 commands = [
-  "python3 -m unittest discover -s tests -t .",
+  "python3 -m unittest discover -s tests",
   "python3 -m compileall -q src check.py agent_harness",
 ]
 

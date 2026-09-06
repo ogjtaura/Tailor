@@ -7,7 +7,7 @@ from unittest import mock
 from agent_harness.tests.helpers import make_config, worker_result
 from agent_harness.workers import base
 from agent_harness.workers.base import run_subprocess
-from agent_harness.workers.claude import ClaudeWorker, PlanningError
+from agent_harness.workers.claude import ClaudeWorker, PlanningError, WorkerUsageLimitError
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -129,6 +129,11 @@ class ClaudeWorkerTests(unittest.TestCase):
     def test_plan_cli_failure_raises_planning_error(self):
         w, _ = self._worker(worker_result(ok=False, exit_code=1, classification="cli_error"))
         with self.assertRaises(PlanningError):
+            w.plan(objective="o")
+
+    def test_plan_usage_limit_raises_worker_usage_limit(self):
+        w, _ = self._worker(worker_result(ok=False, exit_code=1, classification="usage_limit"))
+        with self.assertRaises(WorkerUsageLimitError):
             w.plan(objective="o")
 
 

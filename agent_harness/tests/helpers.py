@@ -6,11 +6,12 @@ import subprocess
 from pathlib import Path
 
 from agent_harness.config import Config
+from agent_harness.git_tools import GitError as GitToolsError, GitTools
 from agent_harness.graph import Printer
 from agent_harness.state import HarnessState
 from agent_harness.workers.base import WorkerResult
 from agent_harness.workers.claude import ClaudeInvocation
-from agent_harness.workers.codex import ReviewOutcome, ReviewVerdict
+from agent_harness.workers.codex import EscalateOutcome, ReviewOutcome, ReviewVerdict
 
 
 def make_config(repo_root: Path, **overrides) -> Config:
@@ -89,10 +90,10 @@ class FakeClaude:
 
 
 class FakeCodex:
-    def __init__(self, *, review_seq=None, escalate_result="root cause: X"):
+    def __init__(self, *, review_seq=None, escalate_result=None):
         self.log_dir = None
         self._review_seq = list(review_seq or [])
-        self._escalate = escalate_result
+        self._escalate = escalate_result or EscalateOutcome(root_cause="root cause: X")
         self.calls: list[str] = []
 
     def review(self, **kw) -> ReviewOutcome:
@@ -101,58 +102,117 @@ class FakeCodex:
             return self._review_seq.pop(0)
         return ReviewOutcome(kind="verdict", verdict=ReviewVerdict(verdict="pass", severity="none"))
 
-    def escalate(self, **kw):
+    def escalate(self, **kw) -> EscalateOutcome:
         self.calls.append("escalate")
         return self._escalate
 
 
 class FakeGit:
-    """In-memory git. Deliberately has no push/reset/checkout methods."""
+    """In-memory git model. Deliberately has no push/reset/checkout methods.
+
+    Tracks per-path content so snapshot()/attributable_changes()/diff_hash()
+    behave like the real GitTools for routing tests.
+    """
 
     def __init__(self, repo_root: Path, *, clean=True):
+        import hashlib
+        self._hashlib = hashlib
         self.repo_root = Path(repo_root)
         self._clean = clean
-        self._changed: list[str] = []
+        self._files: dict[str, str] = {}      # path -> current dirty content
+        self._untracked: set[str] = set()
         self._head = "0" * 40
         self._branch = "agent-harness-v0"
-        self._diff = ""
+        self._detached = False
+        self._commits: dict[str, dict] = {}
+        self._edit_serial = 0
         self.checkpoints: list[dict] = []
 
-    # introspection
+    # -- guards / introspection
     def ensure_repo(self): ...
-    def require_non_default_branch(self): return self._branch
-    def current_branch(self): return self._branch
+    def is_detached(self): return self._detached
+    def require_non_default_branch(self):
+        if self._detached:
+            raise GitToolsError("refusing to run on a detached HEAD")
+        if self._branch in {"main", "master"}:
+            raise GitToolsError(f"refusing to run on protected branch {self._branch!r}")
+        return self._branch
+    def current_branch(self): return "HEAD" if self._detached else self._branch
     def head(self): return self._head
-    def is_clean(self): return self._clean
-    def status_porcelain(self): return "" if self._clean else " M src/x.py\n"
-    def diff(self): return self._diff
+    def is_clean(self): return self._clean and not self._files
+    def status_porcelain(self):
+        return "".join(f" M {p}\n" for p in self._files)
+    def commit_parents(self, sha): return list(self._commits.get(sha, {}).get("parents", []))
+    def commit_message(self, sha): return self._commits.get(sha, {}).get("message", "")
+
+    def tracked_changes(self):
+        return sorted(p for p in self._files if p not in self._untracked)
+    def untracked_paths(self):
+        return sorted(p for p in self._files if p in self._untracked)
+    def changed_paths(self):
+        return sorted(self._files)
+
+    def diff(self):
+        return "".join(f"--- a/{p}\n+++ b/{p}\n{c}\n" for p, c in sorted(self._files.items()))
     def diff_hash(self):
-        import hashlib
-        return hashlib.sha256(self._diff.encode()).hexdigest()
-    def tracked_changes(self): return list(self._changed)
-    def untracked_paths(self): return []
-    def changed_paths(self): return list(self._changed)
+        return self._hashlib.sha256(self.diff().encode()).hexdigest()
+
+    def review_diff(self, owned_paths):
+        owned = sorted(set(owned_paths))
+        return "".join(
+            f"=== {p} ({'new file' if p in self._untracked else 'modified'}) ===\n"
+            f"{self._files.get(p, '')}\n"
+            for p in owned if p in self._files
+        )
+
+    # -- snapshots
+    def snapshot(self, paths=None):
+        from agent_harness.git_tools import WorktreeSnapshot
+        changed = sorted(set(paths)) if paths is not None else self.changed_paths()
+        hashes = {p: (self._hashlib.sha256(self._files[p].encode()).hexdigest()
+                      if p in self._files else None) for p in changed}
+        return WorktreeSnapshot(changed=changed, hashes=hashes)
+
+    def attributable_changes(self, before, after):
+        keys = set(before.hashes) | set(after.hashes) | set(after.changed)
+        cur = {p: (self._hashlib.sha256(self._files[p].encode()).hexdigest()
+                   if p in self._files else None) for p in keys}
+        return sorted(p for p in keys if before.hashes.get(p) != after.hashes.get(p, cur.get(p)))
 
     @staticmethod
     def protected_hits(changed, protected):
-        from agent_harness.git_tools import GitTools
         return GitTools.protected_hits(changed, protected)
 
     def checkpoint(self, message, *, pathspec, protected=()):
         bad = self.protected_hits(pathspec, protected) if protected else []
         if not pathspec:
-            raise RuntimeError("empty pathspec")
+            raise GitToolsError("empty pathspec")
         if bad:
-            raise RuntimeError(f"protected: {bad}")
-        self._head = f"commit{len(self.checkpoints)+1:0>34}"
+            raise GitToolsError(f"protected: {bad}")
+        parent = self._head
+        self._head = f"c{len(self.checkpoints)+1:0>39}"
+        self._commits[self._head] = {"parents": [parent], "message": message}
         self.checkpoints.append({"message": message, "pathspec": list(pathspec)})
-        self._changed = []
+        for p in list(pathspec):
+            self._files.pop(p, None)
+            self._untracked.discard(p)
         return self._head
 
-    # test helpers
-    def set_changed(self, paths): self._changed = list(paths)
-    def set_diff(self, text): self._diff = text
+    # -- test helpers
+    def set_changed(self, paths, *, untracked=False):
+        """Simulate a writer editing `paths` with fresh content each call."""
+        self._edit_serial += 1
+        for p in paths:
+            self._files[p] = f"content-{self._edit_serial}-{p}"
+            if untracked:
+                self._untracked.add(p)
+    def write(self, path, content, *, untracked=False):
+        self._files[path] = content
+        if untracked:
+            self._untracked.add(path)
+    def set_detached(self, val): self._detached = val
     def set_clean(self, val): self._clean = val
+    def set_branch(self, name): self._branch = name
 
 
 class RecordingStore:

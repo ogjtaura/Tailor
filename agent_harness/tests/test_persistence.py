@@ -5,7 +5,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_harness.persistence import Persistence, _atomic_write, reconcile_for_resume
+from agent_harness.persistence import (
+    Persistence,
+    RunLock,
+    RunLockError,
+    StateCorruptError,
+    _atomic_write,
+    reconcile_for_resume,
+)
 from agent_harness.state import HarnessState, StopReason
 from agent_harness.tests.helpers import FakeGit
 
@@ -18,7 +25,7 @@ class AtomicWriteTests(unittest.TestCase):
     def test_round_trip_state(self):
         with tempfile.TemporaryDirectory() as d:
             store = Persistence(d)
-            s = _state(iteration=4, remaining_tasks=["a"], harness_touched_files=["src/x.py"])
+            s = _state(iteration=4, remaining_tasks=["a"], owned_paths=["src/x.py"])
             store.init_run(s)
             store.save(s, note="hello")
             loaded = store.load()
@@ -47,7 +54,7 @@ class ReconcileResumeTests(unittest.TestCase):
 
     def test_write_worker_in_flight_routes_to_verify(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _state(worker_in_flight="claude_implement", harness_touched_files=["src/x.py"])
+            s = _state(worker_in_flight="claude_implement", owned_paths=["src/x.py"])
             g = self._git(d, ["src/x.py"])
             out = reconcile_for_resume(s, g, ["agent_harness/", ".git/"])
             self.assertIsNone(out.stop_reason)
@@ -56,14 +63,14 @@ class ReconcileResumeTests(unittest.TestCase):
 
     def test_unexpected_change_stops(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _state(worker_in_flight="claude_repair", harness_touched_files=["src/x.py"])
+            s = _state(worker_in_flight="claude_repair", owned_paths=["src/x.py"])
             g = self._git(d, ["src/x.py", "src/surprise.py"])
             out = reconcile_for_resume(s, g, ["agent_harness/"])
             self.assertEqual(out.stop_reason, StopReason.UNEXPECTED_WORKTREE_STATE)
 
     def test_protected_change_stops(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _state(worker_in_flight="claude_implement", harness_touched_files=[])
+            s = _state(worker_in_flight="claude_implement", owned_paths=[])
             g = self._git(d, ["agent_harness/graph.py"])
             out = reconcile_for_resume(s, g, ["agent_harness/"])
             self.assertEqual(out.stop_reason, StopReason.PROTECTED_PATH_MODIFIED)
@@ -80,6 +87,76 @@ class ReconcileResumeTests(unittest.TestCase):
             s = _state(worker_in_flight=None, next_node="decide")
             out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
             self.assertEqual(out.next_node, "decide")
+
+    def test_planner_in_flight_reruns_plan(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _state(worker_in_flight="claude_plan")
+            out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
+            self.assertEqual(out.next_node, "plan")
+            self.assertIsNone(out.worker_in_flight)
+
+    def test_unknown_next_node_is_unsafe(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _state(worker_in_flight=None, next_node="banana", last_completed_node="mystery")
+            out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
+            self.assertEqual(out.stop_reason, StopReason.UNSAFE_RESUME_STATE)
+
+    def test_checkpoint_intent_routes_to_checkpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _state(checkpoint_status="intended", checkpoint_pre_head="abc",
+                       next_node="decide")
+            out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
+            self.assertEqual(out.next_node, "checkpoint")
+
+    def test_expected_head_moved_externally_stops(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self._git(d, [])
+            g._head = "actualHEAD"
+            s = _state(worker_in_flight=None, next_node="verify", expected_head="oldHEAD")
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertEqual(out.stop_reason, StopReason.EXPECTED_HEAD_MOVED)
+
+
+class CorruptStateTests(unittest.TestCase):
+    def test_malformed_json_raises_state_corrupt_and_does_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Persistence(d)
+            store.state_path.parent.mkdir(parents=True)
+            store.state_path.write_text("{ this is not json")
+            with self.assertRaises(StateCorruptError):
+                store.load()
+            self.assertEqual(store.state_path.read_text(), "{ this is not json")
+
+    def test_schema_invalid_json_raises_state_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Persistence(d)
+            store.state_path.parent.mkdir(parents=True)
+            store.state_path.write_text(json.dumps({"objective": "o"}))  # missing run_id, etc.
+            with self.assertRaises(StateCorruptError):
+                store.load()
+
+
+class RunLockTests(unittest.TestCase):
+    def test_second_acquire_fails_then_succeeds_after_release(self):
+        with tempfile.TemporaryDirectory() as d:
+            agent_dir = Path(d) / ".agent"
+            a = RunLock(agent_dir).acquire()
+            try:
+                with self.assertRaises(RunLockError):
+                    RunLock(agent_dir).acquire()
+            finally:
+                a.release()
+            # lock is reusable after release
+            b = RunLock(agent_dir).acquire()
+            b.release()
+
+    def test_context_manager_releases_on_exception(self):
+        with tempfile.TemporaryDirectory() as d:
+            agent_dir = Path(d) / ".agent"
+            with self.assertRaises(RuntimeError):
+                with RunLock(agent_dir):
+                    raise RuntimeError("boom")
+            RunLock(agent_dir).acquire().release()  # not stuck
 
 
 if __name__ == "__main__":

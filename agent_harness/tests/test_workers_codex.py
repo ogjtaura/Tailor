@@ -2,8 +2,10 @@ import json
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from agent_harness.tests.helpers import make_config, worker_result
-from agent_harness.workers.codex import CodexWorker
+from agent_harness.workers.codex import CodexWorker, ReviewVerdict
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -101,11 +103,84 @@ class CodexReviewTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
         self.assertIn("--output-schema", argv)
 
-    def test_escalate_returns_text_or_none(self):
+    def test_escalate_returns_outcome_with_text_or_none(self):
         w_ok = self._worker(runner_factory(result=worker_result(stdout="root cause: foo")))
-        self.assertEqual(w_ok.escalate(diff="d", failures="f"), "root cause: foo")
-        w_bad = self._worker(runner_factory(result=worker_result(ok=False, exit_code=1)))
-        self.assertIsNone(w_bad.escalate(diff="d", failures="f"))
+        out = w_ok.escalate(diff="d", failures="f")
+        self.assertEqual(out.root_cause, "root cause: foo")
+        self.assertEqual(out.classification, "ok")
+        w_bad = self._worker(runner_factory(result=worker_result(ok=False, exit_code=1,
+                                                                 classification="cli_error")))
+        out_bad = w_bad.escalate(diff="d", failures="f")
+        self.assertIsNone(out_bad.root_cause)
+        self.assertEqual(out_bad.classification, "cli_error")
+
+    def test_escalate_usage_limit_is_surfaced(self):
+        w = self._worker(runner_factory(result=worker_result(ok=False, exit_code=1,
+                                                             classification="usage_limit")))
+        out = w.escalate(diff="d", failures="f")
+        self.assertTrue(out.is_usage_limit)
+
+
+class ReviewVerdictModelTests(unittest.TestCase):
+    """The local Pydantic model is the real validation layer for untrusted
+    reviewer output; the CLI --output-schema is only defence in depth."""
+
+    def test_valid_pass(self):
+        v = ReviewVerdict.model_validate({"verdict": "pass", "severity": "none", "findings": []})
+        self.assertEqual(v.verdict, "pass")
+
+    def test_valid_fail_with_finding(self):
+        v = ReviewVerdict.model_validate({
+            "verdict": "fail", "severity": "major",
+            "findings": [{"id": "F1", "description": "x"}],
+        })
+        self.assertEqual(v.severity, "major")
+
+    def test_rejects_unknown_field(self):
+        with self.assertRaises(ValidationError):
+            ReviewVerdict.model_validate({"verdict": "pass", "severity": "none",
+                                         "findings": [], "confidence": 0.9})
+
+    def test_rejects_unknown_finding_field(self):
+        with self.assertRaises(ValidationError):
+            ReviewVerdict.model_validate({
+                "verdict": "fail", "severity": "minor",
+                "findings": [{"id": "F1", "description": "x", "bogus": 1}],
+            })
+
+    def test_rejects_invalid_enum(self):
+        with self.assertRaises(ValidationError):
+            ReviewVerdict.model_validate({"verdict": "maybe", "severity": "none", "findings": []})
+        with self.assertRaises(ValidationError):
+            ReviewVerdict.model_validate({"verdict": "pass", "severity": "catastrophic",
+                                         "findings": []})
+
+    def test_pass_cannot_carry_blocking_severity(self):
+        for sev in ("major", "critical"):
+            with self.assertRaises(ValidationError):
+                ReviewVerdict.model_validate({"verdict": "pass", "severity": sev, "findings": []})
+
+    def test_fail_must_have_a_finding(self):
+        with self.assertRaises(ValidationError):
+            ReviewVerdict.model_validate({"verdict": "fail", "severity": "major", "findings": []})
+
+    def test_fail_must_have_nonzero_severity(self):
+        with self.assertRaises(ValidationError):
+            ReviewVerdict.model_validate({
+                "verdict": "fail", "severity": "none",
+                "findings": [{"id": "F1", "description": "x"}],
+            })
+
+
+class ReviewSemanticInfraErrorTests(unittest.TestCase):
+    def test_semantically_invalid_body_is_infra_error_not_pass(self):
+        cfg = make_config(REPO)
+        # verdict=pass but severity=critical -> breaks a local invariant
+        body = json.dumps({"verdict": "pass", "severity": "critical", "findings": []})
+        w = CodexWorker(cfg, executable="/bin/true", runner=runner_factory(write_body=body))
+        out = w.review(diff="d", check_results="ok")
+        self.assertEqual(out.kind, "infra_error")
+        self.assertIsNone(out.verdict)
 
 
 if __name__ == "__main__":

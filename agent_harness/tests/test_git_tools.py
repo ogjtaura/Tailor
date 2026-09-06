@@ -101,6 +101,63 @@ class GitToolsTests(unittest.TestCase):
             with self.assertRaises(GitError):
                 g.checkpoint("m", pathspec=["x"])
 
+    def test_paths_with_spaces_are_parsed_and_committed(self):
+        with temp_repo() as (root, run):
+            g = GitTools(root)
+            (root / "a file.py").write_text("x = 1\n")
+            (root / "dir with space").mkdir()
+            (root / "dir with space" / "b.py").write_text("y = 2\n")
+            changed = g.changed_paths()
+            self.assertIn("a file.py", changed)
+            self.assertIn("dir with space/b.py", changed)
+            snap = g.snapshot()
+            self.assertEqual(sorted(snap.changed), changed)
+            sha = g.checkpoint("harness: spaces", pathspec=changed)
+            self.assertTrue(sha)
+            files = run("show", "--stat", "--name-only", "--format=", "HEAD").stdout
+            self.assertIn("a file.py", files)
+            self.assertIn("dir with space/b.py", files)
+
+    def test_attributable_changes_ignores_unchanged_preexisting(self):
+        with temp_repo() as (root, run):
+            g = GitTools(root)
+            (root / "pre.py").write_text("pre = 1\n")           # dirty before
+            before = g.snapshot()
+            (root / "new.py").write_text("new = 1\n")           # created "by the worker"
+            after = g.snapshot()
+            attributable = g.attributable_changes(before, after)
+            self.assertEqual(attributable, ["new.py"])           # pre.py NOT attributed
+
+    def test_review_diff_includes_untracked_new_file(self):
+        with temp_repo() as (root, run):
+            g = GitTools(root)
+            (root / "app.py").write_text("print('v2')\n")        # tracked change
+            (root / "brand_new.py").write_text("SECRET_MARKER = 42\n")  # untracked
+            text = g.review_diff(["app.py", "brand_new.py"])
+            self.assertIn("v2", text)
+            self.assertIn("brand_new.py", text)
+            self.assertIn("SECRET_MARKER = 42", text)
+            self.assertNotIn("no such file", text.lower())
+
+    def test_detached_head_detected(self):
+        with temp_repo() as (root, run):
+            run("commit", "--allow-empty", "-qm", "second")
+            first = run("rev-parse", "HEAD~1").stdout.strip()
+            run("checkout", "-q", first)
+            g = GitTools(root)
+            self.assertTrue(g.is_detached())
+            with self.assertRaises(GitError):
+                g.require_non_default_branch()
+
+    def test_commit_parents_and_message(self):
+        with temp_repo() as (root, run):
+            g = GitTools(root)
+            (root / "app.py").write_text("v2\n")
+            parent = g.head()
+            sha = g.checkpoint("harness: t [run RID]", pathspec=["app.py"])
+            self.assertEqual(g.commit_parents(sha), [parent])
+            self.assertIn("[run RID]", g.commit_message(sha))
+
     def test_checkpoint_never_pushes_resets_or_add_all(self):
         with temp_repo() as (root, run):
             g = GitTools(root)

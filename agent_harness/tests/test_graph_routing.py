@@ -4,8 +4,9 @@ from pathlib import Path
 from unittest import mock
 
 from agent_harness import graph as graphmod
-from agent_harness.graph import Engine
+from agent_harness.graph import Engine, recursion_budget
 from agent_harness.state import CheckResult, StopReason
+from agent_harness.workers.claude import WorkerUsageLimitError
 from agent_harness.tests.helpers import (
     FakeClaude,
     FakeCodex,
@@ -100,7 +101,7 @@ class CheckpointTests(RoutingScenarioBase):
 
 
 class StagnationTests(RoutingScenarioBase):
-    def test_repeated_identical_failure_escalates(self):
+    def test_repeated_identical_failure_escalates_then_gives_up(self):
         # on_edit does NOT change the diff -> fingerprint + diff hash stay constant
         eng = self.build(agent={"max_iterations": 20, "max_repairs_per_task": 6,
                                 "max_stagnant_iterations": 2},
@@ -108,7 +109,8 @@ class StagnationTests(RoutingScenarioBase):
         final = self.run_engine(eng, checks(False))
         self.assertIn("escalation_review", self.printer.visited)
         self.assertIn("escalate", self.codex.calls)
-        self.assertEqual(final.stop_reason, StopReason.REPAIR_LIMIT)
+        # P2: STAGNATION_UNRESOLVED is now wired (escalation did not break the loop)
+        self.assertEqual(final.stop_reason, StopReason.STAGNATION_UNRESOLVED)
 
 
 class LimitTests(RoutingScenarioBase):
@@ -149,6 +151,69 @@ class ReviewerInfraTests(RoutingScenarioBase):
         self.assertEqual(self.codex.calls, ["review", "review"])  # 1 try + 1 retry
 
 
+class UsageLimitPropagationTests(RoutingScenarioBase):
+    def test_planning_usage_limit_stops_before_any_paid_worker(self):
+        claude = FakeClaude(plan_exc=WorkerUsageLimitError("planner limit"))
+        eng = self.build(claude=claude)
+        final = self.run_engine(eng, checks(True))
+        self.assertEqual(final.stop_reason, StopReason.USAGE_LIMIT)
+        self.assertEqual(claude.calls, ["plan"])          # no implement/repair
+        self.assertEqual(self.codex.calls, [])            # no review/escalate
+
+    def test_review_usage_limit_stops_before_repair(self):
+        limited = ReviewOutcome(kind="infra_error", reason="rate limited",
+                                classification="usage_limit")
+        eng = self.build(codex=FakeCodex(review_seq=[limited]))
+        final = self.run_engine(eng, checks(True))
+        self.assertEqual(final.stop_reason, StopReason.USAGE_LIMIT)
+        self.assertNotIn("repair", self.printer.visited)
+        self.assertNotIn("repair", self.claude.calls)
+        self.assertEqual(self.codex.calls, ["review"])
+
+    def test_escalation_usage_limit_does_not_continue_into_repair(self):
+        from agent_harness.workers.codex import EscalateOutcome
+        eng = self.build(
+            agent={"max_iterations": 20, "max_repairs_per_task": 9, "max_stagnant_iterations": 1},
+            claude=FakeClaude(plan_result=one_task_plan(), on_edit=lambda _r: None),
+            codex=FakeCodex(escalate_result=EscalateOutcome(root_cause=None,
+                                                            classification="usage_limit")),
+        )
+        final = self.run_engine(eng, checks(False))
+        self.assertEqual(final.stop_reason, StopReason.USAGE_LIMIT)
+        self.assertIn("escalation_review", self.printer.visited)
+        self.assertEqual(self.printer.visited[-1], "escalation_review")  # nothing after it
+        self.assertEqual(self.claude.calls.count("repair"), 1)  # only the pre-escalation repair
+
+
+class RecursionBudgetTests(RoutingScenarioBase):
+    def test_budget_scales_with_config(self):
+        from agent_harness.tests.helpers import make_config
+        small = make_config(Path("/tmp"), agent={"max_iterations": 2}, codex={"review_retries": 0})
+        big = make_config(Path("/tmp"), agent={"max_iterations": 40}, codex={"review_retries": 5})
+        self.assertLess(recursion_budget(small), recursion_budget(big))
+        self.assertGreater(recursion_budget(small), 2 * 9)  # comfortably above worst path
+
+    def test_worst_case_path_terminates_without_graph_recursion_error(self):
+        # tiny limits, everything fails: max repair cycles + stagnation + iteration cap
+        eng = self.build(
+            agent={"max_iterations": 4, "max_repairs_per_task": 3, "max_stagnant_iterations": 2},
+            claude=FakeClaude(
+                plan_result=PlanResult(tasks=[PlanTask(id=f"T{i}", title=f"task {i}", rationale="r")
+                                              for i in range(3)]),
+                on_edit=lambda _r: None,
+            ),
+            codex=FakeCodex(review_seq=[INFRA] * 50),
+        )
+        final = self.run_engine(eng, checks(False))
+        self.assertIn(
+            final.stop_reason,
+            {StopReason.ITERATION_LIMIT, StopReason.REPAIR_LIMIT,
+             StopReason.STAGNATION_UNRESOLVED, StopReason.NO_PROGRESS},
+        )
+        # if a GraphRecursionError had leaked, Engine.run would have set CLI_FATAL
+        self.assertNotEqual(final.stop_reason, StopReason.CLI_FATAL)
+
+
 class DecideBoundaryTests(unittest.TestCase):
     def _engine(self, max_iter):
         root = Path(tempfile.mkdtemp())
@@ -162,7 +227,8 @@ class DecideBoundaryTests(unittest.TestCase):
 
     def test_final_iteration_still_reviews_and_checkpoints(self):
         eng = self._engine(3)
-        s = base_state(iteration=3, checks_passed=True, review_status="pending")
+        s = base_state(iteration=3, checks_passed=True, review_status="pending",
+                       owned_paths=["src/x.py"], reviewed_paths=["src/x.py"])
         self.assertEqual(eng._decide_route(s), "review")
         self.assertIsNone(s.stop_reason)
         s.review_status = "pass"
@@ -174,6 +240,24 @@ class DecideBoundaryTests(unittest.TestCase):
         s = base_state(iteration=3, checks_passed=False, repair_attempts=0)
         self.assertEqual(eng._decide_route(s), "end")
         self.assertEqual(s.stop_reason, StopReason.ITERATION_LIMIT)
+
+    def test_no_progress_at_iteration_limit_stops(self):
+        eng = self._engine(3)
+        s = base_state(iteration=3, checks_passed=True, owned_paths=[], no_progress_count=1)
+        self.assertEqual(eng._decide_route(s), "end")
+        self.assertEqual(s.stop_reason, StopReason.ITERATION_LIMIT)
+
+    def test_no_progress_below_limits_routes_to_repair(self):
+        eng = self._engine(9)
+        s = base_state(iteration=2, checks_passed=True, owned_paths=[], no_progress_count=1)
+        self.assertEqual(eng._decide_route(s), "repair")
+        self.assertIsNone(s.stop_reason)
+
+    def test_no_progress_exhausted_stops_with_no_progress(self):
+        eng = self._engine(20)
+        s = base_state(iteration=2, checks_passed=True, owned_paths=[], no_progress_count=5)
+        self.assertEqual(eng._decide_route(s), "end")
+        self.assertEqual(s.stop_reason, StopReason.NO_PROGRESS)
 
 
 if __name__ == "__main__":

@@ -73,10 +73,51 @@ edge functions, the routing decision (and any stop reason) is computed in the
 
 ### Stop reasons
 
-`SUCCESS`, `ITERATION_LIMIT`, `REPAIR_LIMIT`, `STAGNATION_UNRESOLVED`,
-`PLANNING_FAILED`, `REVIEWER_ERROR`, `PROTECTED_PATH_MODIFIED`,
-`DIRTY_WORKTREE`, `UNEXPECTED_WORKTREE_STATE`, `CLI_FATAL`, `USAGE_LIMIT`,
-`USER_ABORT`.
+`SUCCESS`, `ITERATION_LIMIT`, `REPAIR_LIMIT`, `NO_PROGRESS`,
+`STAGNATION_UNRESOLVED`, `PLANNING_FAILED`, `REVIEWER_ERROR`,
+`REVIEW_COVERAGE_GAP`, `PROTECTED_PATH_MODIFIED`, `DIRTY_WORKTREE`,
+`UNEXPECTED_WORKTREE_STATE`, `EXPECTED_HEAD_MOVED`, `DETACHED_HEAD`,
+`CONFIG_INVALID`, `UNSAFE_RESUME_STATE`, `STATE_CORRUPT`, `CLI_FATAL`,
+`USAGE_LIMIT`, `USER_ABORT`.
+
+### V0.1 hardening (safe-for-one-guided-run pass)
+
+- **Verification actually runs.** `[checks]` is executed as configured and an
+  empty `[checks]` list is rejected (`config.require_runnable` / `CONFIG_INVALID`).
+- **A no-op is never success.** A writer iteration that produces no *attributable*
+  repository change does not complete the task; after `max_repairs_per_task`
+  such iterations the run stops `NO_PROGRESS`. No empty commits.
+- **Git ownership is attributed, not absorbed.** Before each writer the worktree
+  is snapshotted (content hashes, NUL-safe path parsing); only paths whose
+  content actually changed during that call join `owned_paths`. Unrelated
+  pre-existing / concurrent changes stop the run rather than being staged.
+- **Expected-HEAD invariant.** HEAD is checked against `expected_head` before
+  every writer and before every checkpoint; harness commits advance it; any
+  other movement stops the run (`EXPECTED_HEAD_MOVED`). Detached HEAD and a
+  default branch are rejected at checkpoint time too.
+- **Crash-safe checkpoint.** Checkpoint records an explicit intent
+  (`intended` → commit → `committed` → bookkeeping), persisted around the
+  non-idempotent commit. On resume it retries the commit, adopts an
+  already-made commit (matched by parent + `[run <id>]` marker), or stops.
+- **Review covers what checkpoint commits.** The reviewer sees a diff built
+  from every owned path including brand-new untracked files
+  (`git diff --no-index`, no index mutation); checkpoint refuses if
+  `owned_paths ⊄ reviewed_paths` (`REVIEW_COVERAGE_GAP`).
+- **Reviewer output is untrusted.** Local Pydantic models forbid unknown
+  fields, reject bad enums, and enforce semantics (a `pass` cannot carry
+  blocking severity; a `fail` must carry findings + non-`none` severity). Any
+  malformed/infra failure is `infra_error` — retried once, then
+  `REVIEWER_ERROR`; it is never interpreted as `PASS` and never routed to
+  Claude repair.
+- **Usage limits propagate from every role** — planning, implement, repair,
+  review, escalation — to `USAGE_LIMIT`, and no further paid worker runs.
+- **Recursion budget** is derived from the configured limits
+  (`recursion_budget()`), so LangGraph's technical limit can never undercut the
+  logical state-machine limits.
+- **Single-run lock.** A real `fcntl.flock` on `.agent/harness.lock`; a second
+  process exits cleanly. The kernel frees it if the holder dies.
+- **Corrupt `.agent/state.json`** raises `STATE_CORRUPT` on resume and is left
+  untouched for inspection.
 
 ## Setup
 
@@ -133,13 +174,19 @@ agent_harness/.venv/bin/python -m agent_harness --resume
 
 Loads `.agent/state.json` and reconciles the worktree:
 
+- A **checkpoint intent** (`intended`/`committed`) is reconciled first: retry the
+  commit, adopt a commit that already landed, or stop if HEAD can't be matched.
 - If a **write-capable** Claude call was in flight at crash time, it is **never
   replayed** — the run re-enters at deterministic `verify` on whatever is on
   disk.
+- `expected_head` must still match HEAD, else stop (`EXPECTED_HEAD_MOVED`).
 - Changes to a **protected path** → stop (`PROTECTED_PATH_MODIFIED`).
 - Changes that cannot be attributed to the harness → stop
   (`UNEXPECTED_WORKTREE_STATE`). Nothing is discarded.
-- A read-only worker in flight (review/escalation) is simply re-run.
+- A read-only worker in flight (review/escalation/planner) is simply re-run.
+- Every persisted `next_node` maps to a defined re-entry; an unknown one stops
+  (`UNSAFE_RESUME_STATE`). A corrupt state file raises `STATE_CORRUPT` and is
+  left untouched.
 
 V0 does not auto-wait after a usage limit — it saves state and exits so
 `--resume` can pick up later.
@@ -182,5 +229,11 @@ with a clean tree.
   schema-valid verdicts, not prose.
 - LangGraph pulls `langchain-core` transitively — present but unused for model
   calls (all model access is CLI subprocess).
-- End-to-end proof so far is `--dry-run` + one real read-only Codex review. A
-  guided full run is the next stage.
+- **Concurrent same-file editing** by a human during a run cannot be attributed
+  and stops the run conservatively (`UNEXPECTED_WORKTREE_STATE`). A dedicated
+  per-run git worktree is the planned stronger isolation model.
+- The "adopt an already-made commit" resume path matches on commit parent + a
+  `[run <id>]` message marker; a hand-crafted matching commit could be adopted.
+- End-to-end proof so far is `--dry-run`, the full mocked suite, the real
+  configured checks, and one real read-only Codex review. A single **guided**
+  end-to-end run is the next stage — not unattended operation.

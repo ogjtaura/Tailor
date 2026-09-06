@@ -5,6 +5,7 @@ Layout::
     .agent/state.json          latest HarnessState (atomic write)
     .agent/progress.md         append-only human-readable log
     .agent/failures.json       accumulated failure fingerprints + findings
+    .agent/harness.lock        OS advisory lock for the single-run guard
     .agent/runs/<run_id>/*.log raw worker stdout/stderr
 
 Writes are atomic (temp file in the same dir -> ``os.replace``) so a crash
@@ -19,7 +20,22 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from agent_harness.state import HarnessState, StopReason, failure_fingerprint
+from pydantic import ValidationError
+
+from agent_harness.state import (
+    RESUMABLE_NODES,
+    HarnessState,
+    StopReason,
+    failure_fingerprint,
+)
+
+
+class StateCorruptError(RuntimeError):
+    """``.agent/state.json`` exists but is not a valid HarnessState."""
+
+
+class RunLockError(RuntimeError):
+    """Another harness process holds the repository-local run lock."""
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -39,6 +55,53 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+class RunLock:
+    """Repository-local single-run lock backed by a real OS advisory lock
+    (``fcntl.flock``). The kernel releases the lock if the holder dies, so a
+    stale lock file never blocks a later run."""
+
+    def __init__(self, agent_dir: Path) -> None:
+        self.path = Path(agent_dir) / "harness.lock"
+        self._fh = None
+
+    def acquire(self) -> "RunLock":
+        import fcntl
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a+")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._fh.close()
+            self._fh = None
+            raise RunLockError(
+                f"another harness run is active (lock held on {self.path})"
+            ) from exc
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(f"{os.getpid()}\n")
+        self._fh.flush()
+        return self
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
 class Persistence:
     def __init__(self, repo_root: str | Path) -> None:
         self.repo_root = Path(repo_root).resolve()
@@ -47,6 +110,9 @@ class Persistence:
         self.progress_path = self.agent_dir / "progress.md"
         self.failures_path = self.agent_dir / "failures.json"
         self.runs_dir = self.agent_dir / "runs"
+
+    def lock(self) -> RunLock:
+        return RunLock(self.agent_dir)
 
     # -- setup ----------------------------------------------------------
 
@@ -80,8 +146,13 @@ class Persistence:
     def load(self) -> Optional[HarnessState]:
         if not self.state_path.is_file():
             return None
-        data = json.loads(self.state_path.read_text())
-        return HarnessState.model_validate(data)
+        try:
+            data = json.loads(self.state_path.read_text())
+            return HarnessState.model_validate(data)
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            raise StateCorruptError(
+                f"{self.state_path} is not a valid harness state: {exc}"
+            ) from exc
 
     # -- derived files ---------------------------------------------------
 
@@ -91,6 +162,7 @@ class Persistence:
             f"status={state.status.value} "
             f"task={state.current_task!r} "
             f"checks_passed={state.checks_passed} review={state.review_status} "
+            f"ckpt={state.checkpoint_status} "
         )
         if note:
             line += f"| {note}"
@@ -115,15 +187,37 @@ class Persistence:
         _atomic_write(self.failures_path, json.dumps(payload, indent=2, sort_keys=True))
 
 
-def reconcile_for_resume(state: HarnessState, git, protected_paths: list[str]) -> HarnessState:
-    """Decide where a resumed run may safely re-enter the graph.
+# Where to re-enter the graph after a clean stop at a given completed node.
+_AFTER_NODE = {
+    None: "plan",
+    "bootstrap": "plan",
+    "plan": "implement",
+    "implement": "verify",
+    "verify": "decide",
+    "review": "decide",
+    "repair": "verify",
+    "escalation_review": "repair",
+    "decide": "decide",
+    "checkpoint": "plan",
+}
 
-    A write-capable Claude call that was in flight at crash time is NEVER
-    replayed: we route straight to deterministic ``verify`` on whatever is on
-    disk. Read-only workers are safe to re-run. Anything that cannot be
-    reconciled stops the run instead of guessing.
+
+def reconcile_for_resume(state: HarnessState, git, protected_paths: list[str]) -> HarnessState:
+    """Decide where a resumed run may safely re-enter the graph, or stop.
+
+    Rules:
+      * A write-capable Claude call in flight at crash time is NEVER replayed -
+        route to deterministic ``verify`` on whatever is on disk.
+      * A checkpoint intent is reconciled against HEAD (retry / adopt / stop).
+      * Read-only workers in flight are simply re-run.
+      * Anything that cannot be reconciled unambiguously stops the run.
     """
-    changed = git.changed_paths()
+    try:
+        changed = git.changed_paths()
+    except Exception as exc:  # pragma: no cover - defensive
+        state.stop_reason = StopReason.CLI_FATAL
+        state.next_node = None
+        return state
 
     hits = git.protected_hits(changed, protected_paths)
     if hits:
@@ -131,28 +225,62 @@ def reconcile_for_resume(state: HarnessState, git, protected_paths: list[str]) -
         state.next_node = None
         return state
 
+    # 1) checkpoint reconciliation takes priority
+    if state.checkpoint_status in ("intended", "committed"):
+        state.worker_in_flight = None
+        state.next_node = "checkpoint"
+        return state
+
+    # 2) HEAD must match what we expect (harness commits move it forward)
+    if state.expected_head is not None:
+        try:
+            if git.head() != state.expected_head:
+                state.stop_reason = StopReason.EXPECTED_HEAD_MOVED
+                state.next_node = None
+                return state
+        except Exception:
+            state.stop_reason = StopReason.CLI_FATAL
+            state.next_node = None
+            return state
+
+    # 3) write-capable worker in flight -> never replay, go verify
     if state.is_write_worker_in_flight():
-        # Partial edits may be on disk. Do NOT re-run the writer. A changed path
-        # is acceptable only if the harness already recorded touching it, or it
-        # is a brand-new untracked file (plausibly created by the crashed
-        # writer). Anything else is an unexplained modification -> stop.
-        known = set(state.harness_touched_files)
-        untracked = set(git.untracked_paths())
+        known = set(state.owned_paths)
+        try:
+            untracked = set(git.untracked_paths())
+        except Exception:
+            untracked = set()
         unexpected = [p for p in changed if p not in known and p not in untracked]
         if unexpected:
             state.stop_reason = StopReason.UNEXPECTED_WORKTREE_STATE
             state.next_node = None
             return state
-        state.record_touched(changed)
+        state.add_owned(changed)
         state.worker_in_flight = None
         state.next_node = "verify"
         return state
 
-    if state.worker_in_flight in ("codex_review", "codex_escalate"):
-        state.next_node = "review" if state.worker_in_flight == "codex_review" else "repair"
+    # 4) read-only workers / planner in flight -> re-run that node
+    if state.worker_in_flight == "codex_review":
         state.worker_in_flight = None
+        state.next_node = "review"
+        return state
+    if state.worker_in_flight == "codex_escalate":
+        state.worker_in_flight = None
+        state.next_node = "repair"
+        return state
+    if state.worker_in_flight == "claude_plan":
+        state.worker_in_flight = None
+        state.next_node = "plan"
         return state
 
-    if not state.next_node:
-        state.next_node = "decide"
+    # 5) no worker in flight -> derive from the last completed node
+    nxt = state.next_node
+    if nxt not in RESUMABLE_NODES:
+        nxt = _AFTER_NODE.get(state.last_completed_node)
+    if nxt not in RESUMABLE_NODES:
+        state.stop_reason = StopReason.UNSAFE_RESUME_STATE
+        state.next_node = None
+        return state
+    state.next_node = nxt
     return state

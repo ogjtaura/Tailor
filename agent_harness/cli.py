@@ -23,8 +23,13 @@ from agent_harness.config import (
     resolve_codex_executable,
 )
 from agent_harness.git_tools import GitError, GitTools
-from agent_harness.graph import Engine, Printer
-from agent_harness.persistence import Persistence, reconcile_for_resume
+from agent_harness.graph import Engine, Printer, recursion_budget
+from agent_harness.persistence import (
+    Persistence,
+    RunLockError,
+    StateCorruptError,
+    reconcile_for_resume,
+)
 from agent_harness.state import HarnessState, Status, StopReason
 
 
@@ -79,6 +84,7 @@ def _banner(cfg: Config, printer: Printer, *, dry_run: bool) -> None:
     printer.info(f"  codex models    review={cfg.codex.review_model} checkpoint={cfg.codex.checkpoint_model}")
     printer.info(f"  --max-turns     {'supported' if mt else 'NOT supported by installed claude (timeout is the bound)'}")
     printer.info(f"  limits          iterations={cfg.agent.max_iterations} repairs/task={cfg.agent.max_repairs_per_task} stagnation={cfg.agent.max_stagnant_iterations}")
+    printer.info(f"  recursion budget {recursion_budget(cfg)}")
     printer.info(f"  planner tools   {cfg.claude.planner_tools}")
     printer.info(f"  edit tools      {cfg.claude.edit_tools}")
     printer.info(f"  protected       {cfg.safety.protected_paths}")
@@ -161,38 +167,60 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return _dry_run(cfg, printer)
 
+    try:
+        cfg.require_runnable()
+    except ConfigError as exc:
+        printer.info(f"config error: {exc}")
+        return 2
+
     store = Persistence(cfg.repo_root)
     git = GitTools(cfg.repo_root)
 
-    if args.resume:
-        state = store.load()
-        if state is None:
-            printer.info("nothing to resume: no .agent/state.json found")
-            return 2
-        state.stop_reason = None
-        try:
-            state = reconcile_for_resume(state, git, cfg.safety.protected_paths)
-        except GitError as exc:
-            printer.info(f"resume aborted: {exc}")
-            return 2
-        if state.stop_reason is not None:
-            state.status = Status.STOPPED
-            store.save(state, note="resume reconciliation refused")
-            _summary(state, printer, store)
-            return 1
-        _banner(cfg, printer, dry_run=False)
-        engine = Engine(cfg, git=git, store=store, printer=printer, resume_target=state.next_node or "decide")
-        final = engine.run(state)
-        _summary(final, printer, store)
-        return 0 if final.stop_reason == StopReason.SUCCESS else 1
-
-    if not args.objective:
+    if not args.resume and not args.objective:
         printer.info("error: provide an objective, or use --resume")
         return 2
 
+    try:
+        lock = store.lock().acquire()
+    except RunLockError as exc:
+        printer.info(f"error: {exc}")
+        return 3
+    try:
+        if args.resume:
+            return _run_resume(cfg, git, store, printer)
+        _banner(cfg, printer, dry_run=False)
+        state = HarnessState(objective=args.objective, run_id=_new_run_id())
+        final = Engine(cfg, git=git, store=store, printer=printer).run(state)
+        _summary(final, printer, store)
+        return 0 if final.stop_reason == StopReason.SUCCESS else 1
+    finally:
+        lock.release()
+
+
+def _run_resume(cfg, git, store, printer) -> int:
+    try:
+        state = store.load()
+    except StateCorruptError as exc:
+        printer.info(f"resume aborted: {exc}")
+        printer.info("(the corrupt state file was left untouched for inspection)")
+        return 2
+    if state is None:
+        printer.info("nothing to resume: no .agent/state.json found")
+        return 2
+    state.stop_reason = None
+    try:
+        state = reconcile_for_resume(state, git, cfg.safety.protected_paths)
+    except GitError as exc:
+        printer.info(f"resume aborted: {exc}")
+        return 2
+    if state.stop_reason is not None:
+        state.status = Status.STOPPED
+        store.save(state, note="resume reconciliation refused")
+        _summary(state, printer, store)
+        return 1
     _banner(cfg, printer, dry_run=False)
-    state = HarnessState(objective=args.objective, run_id=_new_run_id())
-    engine = Engine(cfg, git=git, store=store, printer=printer)
+    engine = Engine(cfg, git=git, store=store, printer=printer,
+                    resume_target=state.next_node or "decide")
     final = engine.run(state)
     _summary(final, printer, store)
     return 0 if final.stop_reason == StopReason.SUCCESS else 1
