@@ -74,5 +74,83 @@
       ]
     },
     "should_pass": false
+  },
+  {
+    "case": "superseded fact cannot be cited",
+    "bank_facts": [
+      {
+        "fact_id": "FACT-FONTERRA-180-OLD",
+        "source_ids": ["SRC-CV-2026"],
+        "category": "work_achievement",
+        "value": "over 175 filters",
+        "text": "Investigated filtration systems and identified over 175 filters.",
+        "ownership": "individual",
+        "state": "completed",
+        "confirmed_at": "2026-02-01",
+        "supersedes": null
+      },
+      {
+        "fact_id": "FACT-FONTERRA-180-CORRECTED",
+        "source_ids": ["SRC-CV-2026"],
+        "category": "work_achievement",
+        "value": "over 180 filters",
+        "text": "Investigated Clean-In-Place and water filtration systems and identified and catalogued over 180 filters.",
+        "ownership": "individual",
+        "state": "completed",
+        "confirmed_at": "2026-02-20",
+        "supersedes": "FACT-FONTERRA-180-OLD"
+      }
+    ],
+    "output": {
+      "object_id": "B5",
+      "text": "Identified over 175 filters.",
+      "claims": [
+        {
+          "claim_id": "C5",
+          "text": "Identified over 175 filters.",
+          "fact_ids": ["FACT-FONTERRA-180-OLD"],
+          "ownership": "individual",
+          "state": "completed"
+        }
+      ]
+    },
+    "should_pass": false,
+    "expected_codes": ["SUPERSEDED_FACT"]
+  },
+  {
+    "case": "coverage state: unmet has neither evidence-table support nor output coverage",
+    "coverage": {
+      "requirement": {"requirement_id": "REQ-UNMET", "text": "Requirement without evidence", "priority": "hard"},
+      "supported_requirement_ids": [],
+      "output_requirement_ids": [],
+      "expected": {"unmet": true, "gap": false, "coverage_miss": false}
+    }
+  },
+  {
+    "case": "coverage state: gap is supported but absent from output",
+    "coverage": {
+      "requirement": {"requirement_id": "REQ-GAP", "text": "Requirement with unused evidence", "priority": "hard"},
+      "supported_requirement_ids": ["REQ-GAP"],
+      "output_requirement_ids": [],
+      "expected": {"unmet": false, "gap": true, "coverage_miss": false}
+    }
+  },
+  {
+    "case": "coverage state: coverage miss is output-covered but missing from evidence table",
+    "coverage": {
+      "requirement": {"requirement_id": "REQ-MISS", "text": "Requirement omitted from evidence table", "priority": "hard"},
+      "supported_requirement_ids": [],
+      "output_requirement_ids": ["REQ-MISS"],
+      "expected": {"unmet": false, "gap": false, "coverage_miss": true}
+    }
+  },
+  {
+    "case": "coverage state: fully covered has both support and output coverage",
+    "coverage": {
+      "requirement": {"requirement_id": "REQ-OK", "text": "Requirement with evidence used in output", "priority": "hard"},
+      "supported_requirement_ids": ["REQ-OK"],
+      "output_requirement_ids": ["REQ-OK"],
+      "expected": {"unmet": false, "gap": false, "coverage_miss": false}
+    }
   }
 ]

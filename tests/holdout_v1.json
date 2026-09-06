@@ -1,0 +1,92 @@
+[
+  {
+    "case": "ownership: collective project recast as an individual result",
+    "category": "ownership",
+    "output": {
+      "object_id": "H1",
+      "text": "I delivered our 7.8-second development result.",
+      "claims": [{"claim_id": "H1-C1", "text": "I delivered our 7.8-second development result.", "fact_ids": ["FACT-GWR-TEAM-7_8"], "ownership": "individual", "state": "development_result"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "ownership: individual volunteer work declared as a team claim but written in first person",
+    "category": "ownership",
+    "output": {
+      "object_id": "H2",
+      "text": "I personally led more than 600 volunteers with DOC.",
+      "claims": [{"claim_id": "H2-C1", "text": "I personally led more than 600 volunteers with DOC.", "fact_ids": ["FACT-SVA-600"], "ownership": "team", "state": "completed"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "state: planned record attempt presented as a held record",
+    "category": "state",
+    "output": {
+      "object_id": "H3",
+      "text": "Our team holds the Guinness World Record for a robotic 4x4x4 cube solve.",
+      "claims": [{"claim_id": "H3-C1", "text": "Our team holds the Guinness World Record for a robotic 4x4x4 cube solve.", "fact_ids": ["FACT-GWR-ATTEMPT"], "ownership": "team", "state": "planned"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "state: development performance presented as completed achievement",
+    "category": "state",
+    "output": {
+      "object_id": "H4",
+      "text": "Our team achieved a 7.8-second end-to-end solve.",
+      "claims": [{"claim_id": "H4-C1", "text": "Our team achieved a 7.8-second end-to-end solve.", "fact_ids": ["FACT-GWR-TEAM-7_8"], "ownership": "team", "state": "completed"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "number drift: unsupported filter count",
+    "category": "number_drift",
+    "output": {
+      "object_id": "H5",
+      "text": "Identified and catalogued over 181 filters.",
+      "claims": [{"claim_id": "H5-C1", "text": "Identified and catalogued over 181 filters.", "fact_ids": ["FACT-FONTERRA-180"], "ownership": "individual", "state": "completed"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "number drift: rotation duration changes milliseconds to seconds",
+    "category": "number_drift",
+    "output": {
+      "object_id": "H6",
+      "text": "Configured the full system for a 28-second 90° rotation.",
+      "claims": [{"claim_id": "H6-C1", "text": "Configured the full system for a 28-second 90° rotation.", "fact_ids": ["FACT-ROTATION-28MS"], "ownership": "individual", "state": "completed"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "semantic responsibility inflation: sole direction of volunteer programme",
+    "category": "responsibility_inflation",
+    "output": {
+      "object_id": "H7",
+      "text": "I solely directed the SVA Big Give programme in 2024 and 2025.",
+      "claims": [{"claim_id": "H7-C1", "text": "I solely directed the SVA Big Give programme in 2024 and 2025.", "fact_ids": ["FACT-SVA-600"], "ownership": "individual", "state": "completed"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "semantic causal invention: development result claimed to secure attempt readiness",
+    "category": "causal_invention",
+    "output": {
+      "object_id": "H8",
+      "text": "Our team's 7.8-second development result secured readiness for an official Guinness World Records attempt.",
+      "claims": [{"claim_id": "H8-C1", "text": "Our team's 7.8-second development result secured readiness for an official Guinness World Records attempt.", "fact_ids": ["FACT-GWR-TEAM-7_8", "FACT-GWR-ATTEMPT"], "ownership": "team", "state": "development_result"}]
+    },
+    "should_pass": false
+  },
+  {
+    "case": "semantic technology swap: unsupported Salesforce workflow",
+    "category": "technology_swap",
+    "output": {
+      "object_id": "H9",
+      "text": "Built a Salesforce workflow to coordinate the SVA Big Give's 600 volunteers.",
+      "claims": [{"claim_id": "H9-C1", "text": "Built a Salesforce workflow to coordinate the SVA Big Give's 600 volunteers.", "fact_ids": ["FACT-SVA-600"], "ownership": "individual", "state": "completed"}]
+    },
+    "should_pass": false
+  }
+]

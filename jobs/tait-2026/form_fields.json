@@ -1,0 +1,25 @@
+{
+  "work_experience_1": {
+    "job_title": "Quality Shift Intern",
+    "company": "Fonterra New Zealand",
+    "location": "New Zealand",
+    "currently_work_here": false,
+    "from": "11/2025",
+    "to": "02/2026"
+  },
+  "work_experience_2": {
+    "job_title": "President",
+    "company": "UC Student Volunteer Army (SVA)",
+    "location": "Christchurch",
+    "currently_work_here": true,
+    "from": "11/2025"
+  },
+  "work_experience_3": {
+    "job_title": "Events Manager",
+    "company": "UC Student Volunteer Army (SVA)",
+    "location": "Christchurch",
+    "currently_work_here": false,
+    "from": "11/2023",
+    "to": "11/2025"
+  }
+}

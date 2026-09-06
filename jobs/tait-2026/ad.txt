@@ -1,0 +1,5 @@
+Paste the raw job ad here, exactly as posted, before parsing it into requirements.json.
+Keep it unedited — the diff between the ad and requirements.json is part of the signal.
+
+Source: Tait Communications — Junior Design Engineer (Summer Intern), 2026
+(original ad text was not captured for this run)

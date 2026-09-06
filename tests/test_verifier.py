@@ -1,6 +1,7 @@
 import json
 import sys
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,8 +18,24 @@ class VerifierTests(unittest.TestCase):
     def test_adversarial_cases(self):
         for case in self.cases:
             with self.subTest(case=case["case"]):
-                failures = verify_output(self.bank, case["output"])
+                if "coverage" in case:
+                    coverage = case["coverage"]
+                    report = coverage_report(
+                        {"requirements": [coverage["requirement"]]},
+                        set(coverage["supported_requirement_ids"]),
+                        set(coverage["output_requirement_ids"]),
+                    )
+                    row = report["requirements"][0]
+                    for state, expected in coverage["expected"].items():
+                        self.assertEqual(row[state], expected, msg=state)
+                    continue
+
+                bank = deepcopy(self.bank)
+                bank["facts"].extend(case.get("bank_facts", []))
+                failures = verify_output(bank, case["output"])
                 self.assertEqual(len(failures) == 0, case["should_pass"], msg=[f.code for f in failures])
+                for code in case.get("expected_codes", []):
+                    self.assertTrue(any(f.code == code for f in failures), msg=[f.code for f in failures])
 
     def test_exact_protected_field_passes(self):
         failures = verify_protected_fields(

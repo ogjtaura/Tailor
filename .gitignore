@@ -10,6 +10,8 @@ ssh_key*
 private_fixtures/
 applicants/
 jobs/*
-!jobs/README.md
+!jobs/*/
+!jobs/*/README.md
 runs/*
-!runs/README.md
+!runs/*/
+!runs/*/README.md

@@ -1,0 +1,22 @@
+{
+  "q1": {
+    "question": "Why does this internship appeal to you, and how does it align with your future career goals?",
+    "max_words": 200,
+    "status": "verified_draft"
+  },
+  "q2": {
+    "question": "Describe a project, achievement, or experience you are most proud of. What was your contribution, and what did you learn from the experience?",
+    "max_words": 200,
+    "status": "verified_draft"
+  },
+  "q3": {
+    "question": "What do you hope to achieve or gain from completing this internship?",
+    "max_words": 200,
+    "status": "verified_draft"
+  },
+  "q4": {
+    "question": "What is your current level of study, and when do you expect to graduate?",
+    "max_words": 200,
+    "status": "verified_draft"
+  }
+}

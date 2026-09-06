@@ -1,0 +1,37 @@
+{
+  "job_id": "tait-2026",
+  "company": "Tait Communications",
+  "title": "Junior Design Engineer (Summer Intern)",
+  "requirements": [
+    {
+      "requirement_id": "REQ-PROBLEM",
+      "text": "Strong problem-solving and critical-thinking skills",
+      "priority": "hard"
+    },
+    {
+      "requirement_id": "REQ-USER",
+      "text": "Interest in technology, product development and user-centred design",
+      "priority": "hard"
+    },
+    {
+      "requirement_id": "REQ-COMMS",
+      "text": "Communicate ideas clearly through visual, written and verbal formats",
+      "priority": "hard"
+    },
+    {
+      "requirement_id": "REQ-DESIGN",
+      "text": "Experience with design research, concept development, CAD, prototyping or related design tools",
+      "priority": "hard"
+    },
+    {
+      "requirement_id": "REQ-TEAM",
+      "text": "Work independently and collaboratively in a multidisciplinary team",
+      "priority": "hard"
+    },
+    {
+      "requirement_id": "REQ-LEARN",
+      "text": "Willingness to learn, explore new ideas and engage with end users",
+      "priority": "hard"
+    }
+  ]
+}
