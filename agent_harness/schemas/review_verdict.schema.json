@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex review verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "severity", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "fail"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["none", "minor", "major", "critical"]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "description", "evidence", "suggested_fix"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" },
+          "evidence": { "type": "string" },
+          "suggested_fix": { "type": "string" }
+        }
+      }
+    }
+  }
+}

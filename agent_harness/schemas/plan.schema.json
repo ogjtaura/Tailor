@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Harness plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tasks"],
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "rationale"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "short stable identifier, e.g. T1"
+          },
+          "title": {
+            "type": "string",
+            "description": "one imperative sentence describing the task"
+          },
+          "rationale": {
+            "type": "string",
+            "description": "why this task is needed for the objective"
+          }
+        }
+      }
+    }
+  }
+}

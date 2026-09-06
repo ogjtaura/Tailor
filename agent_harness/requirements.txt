@@ -1,0 +1,11 @@
+# Harness-only dependencies. Install into a dedicated venv:
+#   python3 -m venv agent_harness/.venv
+#   agent_harness/.venv/bin/pip install -r agent_harness/requirements.txt
+#
+# The Tailor application itself has NO dependencies and its test suite
+# (python3 -m unittest discover -s tests) must keep running on a bare stdlib
+# interpreter.
+
+langgraph>=0.2,<0.7
+pydantic>=2.6,<3
+rich>=13,<15

@@ -1,0 +1,55 @@
+# Configuration for the local autonomous engineering-agent harness (V0).
+# Loaded by agent_harness/config.py via tomllib. Committed to the repo; the
+# harness's runtime data lives under .agent/ (gitignored).
+
+[agent]
+max_iterations = 15          # blocks STARTING a new implement/repair iteration
+max_repairs_per_task = 5
+max_stagnant_iterations = 3  # identical failure fingerprint + unchanged diff
+
+[claude]
+model = "claude-sonnet-5"
+executable = ""              # "" -> auto-resolve: which -> VS Code extension glob
+timeout_seconds = 1800
+planner_max_turns = 6        # applied ONLY if the installed CLI supports --max-turns
+implement_max_turns = 20
+repair_max_turns = 12
+planner_tools = ["Read", "Grep", "Glob"]
+edit_tools = ["Read", "Grep", "Glob", "Edit", "MultiEdit", "Write"]
+
+[codex]
+review_model = "gpt-5.6-luna"
+checkpoint_model = "gpt-5.6-terra"
+executable = ""
+timeout_seconds = 1800
+review_retries = 1          # reviewer INFRASTRUCTURE-failure retries (not verdict fails)
+
+[git]
+auto_commit = true
+branch_required = true          # refuse to run on main / master
+require_clean_worktree = true    # fresh runs only; --resume reconciles instead
+
+[safety]
+# Paths the autonomous workers must never modify. Checked after every
+# write-capable Claude call; a hit stops the run with PROTECTED_PATH_MODIFIED.
+protected_paths = ["agent_harness/", "agent.toml", ".git/", ".agent/"]
+
+[checks]
+# Deterministic project checks. Exit code 0 == pass. A non-zero exit always
+# overrides any worker's claim of success.
+commands = [
+  "python3 -m unittest discover -s tests -t .",
+  "python3 -m compileall -q src check.py agent_harness",
+]
+
+[classify]
+# Case-insensitive substrings that mark a worker failure as a subscription /
+# rate-limit condition (stop cleanly rather than retry).
+usage_limit_patterns = [
+  "usage limit",
+  "rate limit",
+  "quota",
+  "429",
+  "too many requests",
+  "reached your usage limit",
+]

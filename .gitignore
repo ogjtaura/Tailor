@@ -15,3 +15,7 @@ jobs/*
 runs/*
 !runs/*/
 !runs/*/README.md
+
+# Agent harness runtime data + logs, and its private virtualenv.
+.agent/
+agent_harness/.venv/
