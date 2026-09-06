@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .env
 *.sqlite3
+ssh_key
+ssh_key*
 
 # Personal data — canonical fact bank, job material, generated applications.
 # Only the per-directory READMEs are tracked; add sanitised examples with -f.
