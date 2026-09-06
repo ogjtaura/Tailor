@@ -53,7 +53,8 @@
           "source_ids",
           "value",
           "ownership",
-          "state"
+          "state",
+          "confirmed_at"
         ],
         "properties": {
           "fact_id": {
@@ -87,6 +88,18 @@
               "planned",
               "pending_verification"
             ]
+          },
+          "confirmed_at": {
+            "type": "string",
+            "format": "date",
+            "description": "ISO date the value was last confirmed against a source. Used to break conflicts between facts."
+          },
+          "supersedes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "fact_id this fact replaces, or null. The superseded fact stays in the bank for history but must not be cited."
           }
         }
       }

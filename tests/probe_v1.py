@@ -4,7 +4,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from verifier import verify_output
 
-bank = json.loads((ROOT / "private_fixtures" / "johann_tait_2026" / "fact_bank.json").read_text())
+bank = json.loads((ROOT / "applicants" / "jt" / "fact_bank.json").read_text())
 
 def probe(name, claim, expect_fail=True):
     out = {"object_id": "P", "text": claim["text"], "claims": [claim]}

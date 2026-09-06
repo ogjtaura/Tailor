@@ -6,12 +6,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from verifier import verify_output, verify_protected_fields
+from verifier import verify_output, verify_protected_fields, coverage_report
 
 class VerifierTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.bank = json.loads((ROOT / "private_fixtures" / "johann_tait_2026" / "fact_bank.json").read_text())
+        cls.bank = json.loads((ROOT / "applicants" / "jt" / "fact_bank.json").read_text())
         cls.cases = json.loads((ROOT / "tests" / "adversarial_cases.json").read_text())
 
     def test_adversarial_cases(self):
@@ -42,6 +42,43 @@ class VerifierTests(unittest.TestCase):
         }
         failures = verify_output(self.bank, output)
         self.assertTrue(any(f.code == "WORD_LIMIT" for f in failures))
+
+    def test_superseded_fact_cannot_be_cited(self):
+        bank = json.loads(json.dumps(self.bank))
+        old = dict(bank["facts"][3])          # FACT-FONTERRA-180
+        old["fact_id"] = "FACT-FONTERRA-OLD"
+        bank["facts"].append(old)
+        bank["facts"][3]["supersedes"] = "FACT-FONTERRA-OLD"
+
+        output = {
+            "object_id": "CV",
+            "text": "Catalogued over 180 filters.",
+            "claims": [{
+                "claim_id": "C1",
+                "text": "Catalogued over 180 filters.",
+                "fact_ids": ["FACT-FONTERRA-OLD"],
+                "ownership": "individual",
+                "state": "completed",
+            }],
+        }
+        failures = verify_output(bank, output)
+        self.assertTrue(any(f.code == "SUPERSEDED_FACT" for f in failures))
+
+    def test_coverage_states_are_distinct(self):
+        reqs = {"requirements": [
+            {"requirement_id": "R-UNMET", "text": "", "priority": "hard"},
+            {"requirement_id": "R-GAP", "text": "", "priority": "hard"},
+            {"requirement_id": "R-MISS", "text": "", "priority": "hard"},
+            {"requirement_id": "R-OK", "text": "", "priority": "hard"},
+        ]}
+        rep = coverage_report(reqs, supported_requirement_ids={"R-GAP", "R-OK"},
+                              output_requirement_ids={"R-MISS", "R-OK"})
+        by_id = {r["requirement_id"]: r for r in rep["requirements"]}
+        self.assertTrue(by_id["R-UNMET"]["unmet"])
+        self.assertTrue(by_id["R-GAP"]["gap"])
+        self.assertTrue(by_id["R-MISS"]["coverage_miss"])
+        self.assertFalse(by_id["R-MISS"]["unmet"])
+        self.assertTrue(all(not by_id["R-OK"][k] for k in ("unmet", "gap", "coverage_miss")))
 
 if __name__ == "__main__":
     unittest.main()

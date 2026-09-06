@@ -5,7 +5,8 @@
 
 Expects in that folder:
     output.json        pasted from the model (see schemas/application_output.schema.json)
-    ../../..           applicant + job paths resolved from output.json fields
+                       with _bank_path / _reqs_path pointing at the applicant
+                       and job files.
 
 Or pass paths explicitly:
 
@@ -77,6 +78,8 @@ def main():
         for r in rep["requirements"]:
             if r["unmet"]:
                 mark, note = f"{RED}none{OFF} ", "no evidence in bank"
+            elif r["coverage_miss"]:
+                mark, note = f"{YEL}miss{OFF} ", "a claim cites evidence for this, but supported_requirement_ids omits it"
             elif r["gap"]:
                 mark, note = f"{YEL}gap{OFF}  ", "you have evidence, the output does not use it"
             else:
@@ -86,8 +89,10 @@ def main():
                 print(f"         {DIM}{note}{OFF}")
 
         gaps = [r for r in rep["requirements"] if r["gap"]]
+        misses = [r for r in rep["requirements"] if r["coverage_miss"]]
         unmet = [r for r in rep["requirements"] if r["unmet"] and r["priority"] == "hard"]
         print(f"\n  {len(gaps)} gap(s) to fix by adding content. "
+              f"{len(misses)} coverage miss(es) to fix in the evidence table. "
               f"{len(unmet)} hard requirement(s) with no evidence at all.")
         if unmet:
             print(f"  {DIM}Hard requirements with no evidence are a decision about whether to "

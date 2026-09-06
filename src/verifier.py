@@ -10,6 +10,9 @@ Changes from v1, each closing a measured false accept:
   - non_factual no longer silently skips everything
   - protected fields are swept, not just checkable one at a time
   - applicant_id is enforced
+  - a claim may not cite a fact that another fact supersedes
+  - coverage_report separates a missing evidence-table row (coverage_miss) from
+    a genuine gap and from having no evidence at all
 
 No third-party dependencies. No network. Runs offline, free.
 """
@@ -50,6 +53,7 @@ class Failure:
 
 def _fact_index(bank): return {f["fact_id"]: f for f in bank.get("facts", [])}
 def _source_ids(bank): return {s["source_id"] for s in bank.get("sources", [])}
+def _superseded_ids(bank): return {f["supersedes"] for f in bank.get("facts", []) if f.get("supersedes")}
 
 
 def extract_num_units(text: str) -> Set[Tuple[str, str]]:
@@ -97,6 +101,7 @@ def verify_protected_fields(bank: Dict[str, Any], produced: Dict[str, Any]) -> L
 def verify_output(bank: Dict[str, Any], output_obj: Dict[str, Any]) -> List[Failure]:
     failures: List[Failure] = []
     facts, sources = _fact_index(bank), _source_ids(bank)
+    superseded = _superseded_ids(bank)
     object_id = output_obj.get("object_id", "")
 
     if output_obj.get("applicant_id") and output_obj["applicant_id"] != bank.get("applicant_id"):
@@ -136,6 +141,10 @@ def verify_output(bank: Dict[str, Any], output_obj: Dict[str, Any]) -> List[Fail
             if fid not in facts:
                 failures.append(Failure("UNKNOWN_FACT", f"Unknown fact ID: {fid}", object_id, cid))
             else:
+                if fid in superseded:
+                    failures.append(Failure("SUPERSEDED_FACT",
+                        f"Fact {fid} has been superseded and must not be cited; use its replacement",
+                        object_id, cid))
                 cited.append(facts[fid])
         if not cited:
             continue
@@ -186,6 +195,15 @@ def verify_output(bank: Dict[str, Any], output_obj: Dict[str, Any]) -> List[Fail
 
 
 def coverage_report(requirement_bank, supported_requirement_ids, output_requirement_ids):
+    """Separate three questions that CV tools usually collapse:
+
+      - unmet:         the bank has no evidence for the requirement.
+      - gap:           the bank has evidence, the output did not use it.
+      - coverage_miss: a produced claim cites evidence for the requirement, but
+                       the evidence table (supported_requirement_ids) left it
+                       out. Silent, and it costs you the job rather than an
+                       awkward interview, so it is worse than a fabrication.
+    """
     rows = []
     for req in requirement_bank.get("requirements", []):
         rid = req["requirement_id"]
@@ -198,7 +216,8 @@ def coverage_report(requirement_bank, supported_requirement_ids, output_requirem
             "applicant_supported": supported,
             "output_covered": covered,
             "gap": supported and not covered,
-            "unmet": not supported,
+            "coverage_miss": covered and not supported,
+            "unmet": not supported and not covered,
         })
     return {"requirements": rows}
 

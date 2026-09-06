@@ -1,5 +1,13 @@
 __pycache__/
 *.pyc
 .env
-private_fixtures/
 *.sqlite3
+
+# Personal data — canonical fact bank, job material, generated applications.
+# Only the per-directory READMEs are tracked; add sanitised examples with -f.
+private_fixtures/
+applicants/
+jobs/*
+!jobs/README.md
+runs/*
+!runs/README.md

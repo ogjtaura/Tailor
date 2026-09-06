@@ -80,6 +80,17 @@ Facts can be:
 
 A pending or planned achievement cannot be rewritten as completed.
 
+## Fact history
+
+Every fact carries `confirmed_at`, the date its value was last checked against a
+source. When two facts conflict, the later `confirmed_at` wins and the conflict
+is flagged, not silently resolved.
+
+Corrections are additive. A corrected fact is appended with a new `confirmed_at`
+and `supersedes` pointing at the old `fact_id`; the old fact stays in the bank
+so the correction history survives, but the verifier rejects any claim that
+cites a superseded fact.
+
 ## Repair rule
 
 Never run a global polish pass over verified content.
