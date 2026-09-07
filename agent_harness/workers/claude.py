@@ -25,6 +25,12 @@ from agent_harness.workers.base import WorkerResult, run_subprocess
 
 _PLAN_SCHEMA = Path(__file__).parent.parent / "schemas" / "plan.schema.json"
 
+
+def _plan_schema_json() -> str:
+    """The literal JSON text of the plan schema. ``claude --json-schema`` wants
+    the schema itself, not a path to it."""
+    return _PLAN_SCHEMA.read_text(encoding="utf-8")
+
 _SYSTEM_APPEND = (
     "You are the implementation worker inside an autonomous harness. Stay strictly "
     "within this repository. Never modify agent_harness/, agent.toml, .git/, or "
@@ -141,7 +147,7 @@ class ClaudeWorker:
         argv = self._base_argv(prompt, role="plan") + [
             "--permission-mode", "plan",
             "--tools", *self.config.claude.planner_tools,
-            "--json-schema", str(_PLAN_SCHEMA),
+            "--json-schema", _plan_schema_json(),
         ]
         argv += self._maybe_max_turns(self.config.claude.planner_max_turns)
         inv = self._run(argv, role="plan", iteration=iteration)

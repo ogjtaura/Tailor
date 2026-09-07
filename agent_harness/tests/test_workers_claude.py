@@ -6,6 +6,7 @@ from unittest import mock
 
 from agent_harness.tests.helpers import make_config, worker_result
 from agent_harness.workers import base
+from agent_harness.workers import claude as claudemod
 from agent_harness.workers.base import run_subprocess
 from agent_harness.workers.claude import ClaudeWorker, PlanningError, WorkerUsageLimitError
 
@@ -114,6 +115,19 @@ class ClaudeWorkerTests(unittest.TestCase):
         self.assertNotIn("Edit", argv)
         self.assertNotIn("Write", argv)
         self.assertNotIn("Bash", argv)
+
+        # `claude --json-schema` takes literal JSON, never a filesystem path.
+        schema_arg = argv[argv.index("--json-schema") + 1]
+        self.assertNotEqual(schema_arg, str(claudemod._PLAN_SCHEMA))
+        parsed = json.loads(schema_arg)                    # must be valid JSON
+        self.assertEqual(parsed, json.loads(
+            claudemod._PLAN_SCHEMA.read_text(encoding="utf-8")))
+        # expected plan-schema shape
+        self.assertEqual(parsed.get("type"), "object")
+        self.assertIn("tasks", parsed.get("properties", {}))
+        tasks_items = parsed["properties"]["tasks"]["items"]["properties"]
+        self.assertIn("id", tasks_items)
+        self.assertIn("title", tasks_items)
 
     def test_plan_invalid_output_raises_planning_error(self):
         w, _ = self._worker(worker_result(stdout=json.dumps({"result": "sorry, no JSON here"})))
