@@ -40,6 +40,54 @@ class VerifierTests(unittest.TestCase):
                 for code in case.get("expected_codes", []):
                     self.assertTrue(any(f.code == code for f in failures), msg=[f.code for f in failures])
 
+    def test_missing_applicant_id_fails(self):
+        output = {
+            "object_id": "ID-MISSING",
+            "claims": [],
+        }
+        failures = verify_output(self.bank, output)
+        self.assertTrue(any(
+            f.code == "APPLICANT_MISSING" and f.severity == "error"
+            for f in failures
+        ), msg=[f.code for f in failures])
+
+    def test_blank_applicant_id_fails(self):
+        output = {
+            "object_id": "ID-BLANK",
+            "applicant_id": "",
+            "claims": [],
+        }
+        failures = verify_output(self.bank, output)
+        self.assertTrue(any(
+            f.code == "APPLICANT_MISSING" and f.severity == "error"
+            for f in failures
+        ), msg=[f.code for f in failures])
+
+    def test_wrong_applicant_id_fails_with_mismatch(self):
+        output = {
+            "object_id": "ID-WRONG",
+            "applicant_id": "SOMEONE-ELSE",
+            "claims": [],
+        }
+        failures = verify_output(self.bank, output)
+        self.assertTrue(any(
+            f.code == "APPLICANT_MISMATCH" and f.severity == "error"
+            for f in failures
+        ), msg=[f.code for f in failures])
+        self.assertFalse(any(
+            f.code == "APPLICANT_MISSING"
+            for f in failures
+        ), msg=[f.code for f in failures])
+
+    def test_correct_applicant_id_passes_identity_gate(self):
+        output = {
+            "object_id": "ID-CORRECT",
+            "applicant_id": self.bank["applicant_id"],
+            "claims": [],
+        }
+        failures = verify_output(self.bank, output)
+        self.assertEqual(failures, [])
+
     def test_exact_protected_field_passes(self):
         failures = verify_protected_fields(
             self.bank, {"employment.f1.job_title": "Quality Shift Intern"}
@@ -56,6 +104,7 @@ class VerifierTests(unittest.TestCase):
         text = "word " * 201
         output = {
             "object_id": "Q1",
+            "applicant_id": self.bank["applicant_id"],
             "text": text,
             "word_limit": 200,
             "claims": []
@@ -72,6 +121,7 @@ class VerifierTests(unittest.TestCase):
 
         output = {
             "object_id": "CV",
+            "applicant_id": self.bank["applicant_id"],
             "text": "Catalogued over 180 filters.",
             "claims": [{
                 "claim_id": "C1",

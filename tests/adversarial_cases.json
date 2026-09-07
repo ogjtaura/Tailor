@@ -3,6 +3,7 @@
     "case": "supported team result",
     "output": {
       "object_id": "B1",
+      "applicant_id": "APPLICANT-TEST-001",
       "text": "Our team achieved an approximately 7.8-second development solve.",
       "claims": [
         {
@@ -22,6 +23,7 @@
     "case": "team to individual inflation",
     "output": {
       "object_id": "B2",
+      "applicant_id": "APPLICANT-TEST-001",
       "text": "I achieved a 7.8-second development solve.",
       "claims": [
         {
@@ -41,6 +43,7 @@
     "case": "pending record represented as completed",
     "output": {
       "object_id": "B3",
+      "applicant_id": "APPLICANT-TEST-001",
       "text": "Guinness World Record holder.",
       "claims": [
         {
@@ -60,6 +63,7 @@
     "case": "numeric drift from user-confirmed result",
     "output": {
       "object_id": "B4",
+      "applicant_id": "APPLICANT-TEST-001",
       "text": "Configured the system to achieve 30 ms per 90\u00b0 rotation.",
       "claims": [
         {
@@ -103,6 +107,7 @@
     ],
     "output": {
       "object_id": "B5",
+      "applicant_id": "APPLICANT-TEST-001",
       "text": "Identified over 175 filters.",
       "claims": [
         {
