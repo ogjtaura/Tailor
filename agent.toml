@@ -32,7 +32,7 @@ require_clean_worktree = true    # fresh runs only; --resume reconciles instead
 [safety]
 # Paths the autonomous workers must never modify. Checked after every
 # write-capable Claude call; a hit stops the run with PROTECTED_PATH_MODIFIED.
-protected_paths = ["agent_harness/", "agent.toml", ".git/", ".agent/"]
+protected_paths = ["agent_harness/", "agent.toml", ".git/", ".agent/", ".tests/", ".docs/", ".schemas/"]
 
 [checks]
 # Deterministic project checks. Exit code 0 == pass. A non-zero exit always
