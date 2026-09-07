@@ -211,7 +211,7 @@ def coverage_report(requirement_bank, supported_requirement_ids, output_requirem
         covered = rid in output_requirement_ids
         rows.append({
             "requirement_id": rid,
-            "priority": req["priority"],
+            "priority": req.get("priority", ""),
             "text": req.get("text", ""),
             "applicant_supported": supported,
             "output_covered": covered,
