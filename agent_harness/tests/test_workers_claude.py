@@ -122,6 +122,8 @@ class ClaudeWorkerTests(unittest.TestCase):
         parsed = json.loads(schema_arg)                    # must be valid JSON
         self.assertEqual(parsed, json.loads(
             claudemod._PLAN_SCHEMA.read_text(encoding="utf-8")))
+        # the installed Claude CLI rejects a top-level $schema dialect declaration
+        self.assertNotIn("$schema", parsed)
         # expected plan-schema shape
         self.assertEqual(parsed.get("type"), "object")
         self.assertIn("tasks", parsed.get("properties", {}))
