@@ -33,6 +33,7 @@ from agent_harness.state import (
     is_stagnant,
     update_stagnation,
 )
+from agent_harness.agents import AgentRouter
 from agent_harness.workers.claude import ClaudeWorker, PlanningError, WorkerUsageLimitError
 from agent_harness.workers.codex import CodexWorker
 
@@ -105,6 +106,7 @@ class Engine:
         *,
         claude: Optional[ClaudeWorker] = None,
         codex: Optional[CodexWorker] = None,
+        agents: Optional[AgentRouter] = None,
         git: Optional[GitTools] = None,
         store: Optional[Persistence] = None,
         printer: Optional[Printer] = None,
@@ -113,8 +115,10 @@ class Engine:
         self.config = config
         self.git = git or GitTools(config.repo_root)
         self.store = store or Persistence(config.repo_root)
-        self.claude = claude or ClaudeWorker(config)
-        self.codex = codex or CodexWorker(config)
+        # ROLE -> BACKEND -> MODEL is resolved by the router; the graph never
+        # picks a backend or builds provider argv. `claude=`/`codex=` stay as
+        # injection points for the backend adapters (tests, dry-run).
+        self.agents = agents or AgentRouter(config, claude=claude, codex=codex)
         self.printer = printer or Printer()
         self.resume_target = resume_target
 
@@ -338,8 +342,7 @@ class Engine:
                 return state
 
         log_dir = self.store.run_log_dir(state)
-        self.claude.log_dir = Path(log_dir)
-        self.codex.log_dir = Path(log_dir)
+        self.agents.bind_run(state.run_id, Path(log_dir))
         state.last_completed_node = "bootstrap"
         self.printer.transition("bootstrap", state, f"branch={self.git.current_branch()}")
         self.store.save(state, note="bootstrap ok")
@@ -351,7 +354,7 @@ class Engine:
             state.worker_in_flight = "claude_plan"
             self.store.save(state, note="planner in flight")
             try:
-                plan = self.claude.plan(
+                plan = self.agents.plan(
                     objective=state.objective,
                     repo_context=self._repo_context(),
                     iteration=state.iteration,
@@ -427,12 +430,12 @@ class Engine:
         self.store.save(state, note=f"{role} in flight")
 
         if role == "implement":
-            inv = self.claude.implement(
+            inv = self.agents.implement(
                 objective=state.objective, task=state.current_task or "",
                 repo_context=self._repo_context(), iteration=state.iteration,
             )
         else:
-            inv = self.claude.repair(
+            inv = self.agents.repair(
                 objective=state.objective, task=state.current_task or "",
                 failures=self._failure_brief(state), root_cause=state.root_cause or "",
                 iteration=state.iteration,
@@ -788,7 +791,7 @@ class Engine:
 
         state.worker_in_flight = "codex_review"
         self.store.save(state, note="review in flight")
-        outcome = self.codex.review(
+        outcome = self.agents.routine_review(
             diff=review_input,
             check_results=verifier.summarise(state.check_results),
             iteration=state.iteration,
@@ -847,7 +850,7 @@ class Engine:
                 )
         except GitError:
             diff = ""
-        outcome = self.codex.escalate(
+        outcome = self.agents.escalation_review(
             diff=diff, failures=self._failure_brief(state), iteration=state.iteration
         )
         state.worker_in_flight = None

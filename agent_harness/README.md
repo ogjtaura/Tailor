@@ -19,10 +19,28 @@ performed. Activate deliberately.
 | Deterministic project checks | `verifier.py` |
 | Git introspection + checkpoint commits | `git_tools.py` |
 | Recoverable state under `.agent/` (JSON, no DB) | `persistence.py` |
-| `claude` subprocess worker (plan / implement / repair) | `workers/claude.py` |
-| `codex` subprocess worker (review / escalate) | `workers/codex.py` |
+| ROLE → BACKEND → MODEL routing + invocation-boundary telemetry | `agents.py` |
+| Engineering-agent execution telemetry (JSONL) | `telemetry.py` |
+| `claude` backend adapter (plan / implement / repair) | `workers/claude.py` |
+| `codex` backend adapter (review / escalate) | `workers/codex.py` |
 | Shared subprocess plumbing (env scrub, timeout, classify) | `workers/base.py` |
 | CLI entry point | `cli.py` / `__main__.py` |
+
+### Role → backend → model (V1)
+
+The graph asks `agents.AgentRouter` for a **role** — `planner`, `implementer`,
+`repairer`, `routine_reviewer`, `escalation_reviewer` — and the router resolves
+it to a **backend** (`claude_code` | `codex`, the only two adapters this version
+ships) and a **model** from `[roles]` in `agent.toml`. Omit `[roles]` (or any
+role) and the V0 default applies: planner/implementer/repairer →
+`claude_code`/`[claude].model`; `routine_reviewer` → `codex`/`[codex].review_model`;
+`escalation_reviewer` → `codex`/`[codex].checkpoint_model`. Provider argv stays
+inside the adapters; orchestration never names a backend. Each invocation is
+recorded (role, backend, model, timing, exit/classification) to
+`.agent/runs/<run_id>/agents.jsonl`; a telemetry write failure never affects the
+run. The router is a dispatch + telemetry seam only — verification stays
+deterministic and independent, the writer still cannot review itself, and the
+harness still owns the checkpoint.
 
 - The **writer** (`claude`) is an untrusted transformation step. The
   **verifier** (deterministic exit codes) is the source of truth. A non-zero

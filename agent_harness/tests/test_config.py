@@ -1,4 +1,5 @@
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,6 +31,34 @@ class LoadConfigTests(unittest.TestCase):
     def test_max_iterations_override(self):
         cfg = load_config(REPO / "agent.toml", REPO).with_overrides(max_iterations=3)
         self.assertEqual(cfg.agent.max_iterations, 3)
+
+    def test_repo_agent_toml_role_routing_matches_v0(self):
+        cfg = load_config(REPO / "agent.toml", REPO)
+        r = cfg.resolved_roles()
+        self.assertEqual((r["planner"].backend, r["planner"].model), ("claude_code", "claude-sonnet-5"))
+        self.assertEqual((r["implementer"].backend, r["implementer"].model), ("claude_code", "claude-sonnet-5"))
+        self.assertEqual((r["repairer"].backend, r["repairer"].model), ("claude_code", "claude-sonnet-5"))
+        self.assertEqual((r["routine_reviewer"].backend, r["routine_reviewer"].model), ("codex", "gpt-5.6-luna"))
+        self.assertEqual((r["escalation_reviewer"].backend, r["escalation_reviewer"].model), ("codex", "gpt-5.6-terra"))
+        # with_overrides round-trips the [roles] table
+        self.assertEqual(cfg.with_overrides(max_iterations=1).resolve_role("planner").model,
+                         "claude-sonnet-5")
+
+    def test_roles_table_is_optional(self):
+        d = tempfile.mkdtemp()
+        p = Path(d) / "agent.toml"
+        p.write_text('[checks]\ncommands = ["true"]\n')   # no [roles] at all
+        cfg = load_config(p, REPO)
+        self.assertEqual(cfg.resolve_role("routine_reviewer").model, "gpt-5.6-luna")
+        self.assertEqual(cfg.resolve_role("planner").backend, "claude_code")
+
+    def test_bad_backend_in_roles_is_config_error(self):
+        d = tempfile.mkdtemp()
+        p = Path(d) / "agent.toml"
+        p.write_text('[checks]\ncommands = ["true"]\n'
+                     '[roles]\nplanner = { backend = "kimi", model = "x" }\n')
+        with self.assertRaises(ConfigError):
+            load_config(p, REPO)
 
 
 class ExecutableResolutionTests(unittest.TestCase):

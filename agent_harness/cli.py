@@ -82,8 +82,9 @@ def _banner(cfg: Config, printer: Printer, *, dry_run: bool) -> None:
     printer.info(f"  config          {cfg.config_path}")
     printer.info(f"  claude          {claude_exe}")
     printer.info(f"  codex           {codex_exe}")
-    printer.info(f"  claude model    {cfg.claude.model}")
-    printer.info(f"  codex models    review={cfg.codex.review_model} checkpoint={cfg.codex.checkpoint_model}")
+    printer.info("  role -> backend / model")
+    for role, a in cfg.resolved_roles().items():
+        printer.info(f"    {role:<20} {a.backend} / {a.model}")
     printer.info(f"  --max-turns     {'supported' if mt else 'NOT supported by installed claude (timeout is the bound)'}")
     printer.info(f"  limits          iterations={cfg.agent.max_iterations} repairs/task={cfg.agent.max_repairs_per_task} stagnation={cfg.agent.max_stagnant_iterations}")
     printer.info(f"  recursion budget {recursion_budget(cfg)}")

@@ -111,13 +111,15 @@ class CodexWorker:
 
     # -- routine review -----------------------------------------------------
 
-    def review(self, *, diff: str, check_results: str, iteration: int = 0) -> ReviewOutcome:
+    def review(
+        self, *, diff: str, check_results: str, iteration: int = 0, model: str | None = None
+    ) -> ReviewOutcome:
         prompt = render("reviewer", diff=diff, check_results=check_results)
         with tempfile.TemporaryDirectory(prefix="agent-harness-review-") as tmp:
             out_file = Path(tmp) / "verdict.json"
             argv = [
                 self._executable, "exec",
-                "--model", self.config.codex.review_model,
+                "--model", model or self.config.codex.review_model,
                 "--sandbox", "read-only",
                 "--cd", str(self.config.repo_root),
                 "--output-schema", str(_VERDICT_SCHEMA),
@@ -165,11 +167,13 @@ class CodexWorker:
 
     # -- escalation review (root-cause analysis) --------------------------
 
-    def escalate(self, *, diff: str, failures: str, iteration: int = 0) -> EscalateOutcome:
+    def escalate(
+        self, *, diff: str, failures: str, iteration: int = 0, model: str | None = None
+    ) -> EscalateOutcome:
         prompt = render("escalation_reviewer", diff=diff, failures=failures)
         argv = [
             self._executable, "exec",
-            "--model", self.config.codex.checkpoint_model,
+            "--model", model or self.config.codex.checkpoint_model,
             "--sandbox", "read-only",
             "--cd", str(self.config.repo_root),
             "--color", "never",

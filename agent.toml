@@ -24,6 +24,20 @@ executable = ""
 timeout_seconds = 1800
 review_retries = 1          # reviewer INFRASTRUCTURE-failure retries (not verdict fails)
 
+[roles]
+# ROLE -> BACKEND -> MODEL for the engineering harness. backend is one of
+# "claude_code" | "codex" (the only two adapters this version implements).
+# Omit a role, or the whole [roles] table, to fall back to the V0 defaults
+# (planner/implementer/repairer -> claude_code/[claude].model;
+#  routine_reviewer -> codex/[codex].review_model;
+#  escalation_reviewer -> codex/[codex].checkpoint_model). model = "" also
+# means "use the backend's default model".
+planner            = { backend = "claude_code", model = "claude-sonnet-5" }
+implementer        = { backend = "claude_code", model = "claude-sonnet-5" }
+repairer           = { backend = "claude_code", model = "claude-sonnet-5" }
+routine_reviewer   = { backend = "codex",       model = "gpt-5.6-luna" }
+escalation_reviewer = { backend = "codex",      model = "gpt-5.6-terra" }
+
 [git]
 auto_commit = true
 branch_required = true          # refuse to run on main / master

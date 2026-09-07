@@ -13,8 +13,21 @@ import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+# --- engineering-harness agent routing -------------------------------------
+# A *role* (what the harness needs done) is resolved to a *backend* (which CLI
+# adapter runs it) and a *model*. Only the two backends the V0 pipeline already
+# uses are supported.
+BackendName = Literal["claude_code", "codex"]
+RoleName = Literal[
+    "planner", "implementer", "repairer", "routine_reviewer", "escalation_reviewer"
+]
+ROLE_NAMES: tuple[RoleName, ...] = (
+    "planner", "implementer", "repairer", "routine_reviewer", "escalation_reviewer"
+)
 
 REPO_ROOT_ENV = "AGENT_HARNESS_REPO_ROOT"
 
@@ -82,6 +95,25 @@ class ChecksSection(BaseModel):
     commands: list[str] = Field(default_factory=list)
 
 
+class RoleAssignment(BaseModel):
+    """One engineering role -> (backend, model). ``model`` may be omitted, in
+    which case the backend's own default model is used."""
+    model_config = ConfigDict(extra="forbid")
+    backend: BackendName
+    model: str = ""
+
+
+class RolesSection(BaseModel):
+    """Optional explicit role routing. Any role left unset falls back to the
+    V0 default (see :meth:`Config.resolve_role`)."""
+    model_config = ConfigDict(extra="forbid")
+    planner: Optional[RoleAssignment] = None
+    implementer: Optional[RoleAssignment] = None
+    repairer: Optional[RoleAssignment] = None
+    routine_reviewer: Optional[RoleAssignment] = None
+    escalation_reviewer: Optional[RoleAssignment] = None
+
+
 class ClassifySection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     usage_limit_patterns: list[str] = Field(
@@ -105,6 +137,7 @@ class Config(BaseModel):
     safety: SafetySection = Field(default_factory=SafetySection)
     checks: ChecksSection = Field(default_factory=ChecksSection)
     classify: ClassifySection = Field(default_factory=ClassifySection)
+    roles: RolesSection = Field(default_factory=RolesSection)
 
     # Populated at load time (not from TOML).
     repo_root: Path
@@ -115,6 +148,38 @@ class Config(BaseModel):
         if max_iterations is not None:
             data["agent"]["max_iterations"] = max_iterations
         return Config(**data)
+
+    # -- engineering-role routing -----------------------------------------
+
+    def resolve_role(self, role: RoleName) -> RoleAssignment:
+        """Resolve a role to ``(backend, model)``. An explicit ``[roles.<role>]``
+        wins; otherwise the V0 default applies:
+
+            planner / implementer / repairer -> claude_code / [claude].model
+            routine_reviewer                 -> codex / [codex].review_model
+            escalation_reviewer              -> codex / [codex].checkpoint_model
+        """
+        explicit = getattr(self.roles, role, None)
+        if explicit is not None:
+            model = explicit.model or self._default_model(explicit.backend, role)
+            return RoleAssignment(backend=explicit.backend, model=model)
+        if role in ("planner", "implementer", "repairer"):
+            return RoleAssignment(backend="claude_code", model=self.claude.model)
+        if role == "routine_reviewer":
+            return RoleAssignment(backend="codex", model=self.codex.review_model)
+        if role == "escalation_reviewer":
+            return RoleAssignment(backend="codex", model=self.codex.checkpoint_model)
+        raise ConfigError(f"unknown engineering role {role!r}")
+
+    def _default_model(self, backend: BackendName, role: RoleName) -> str:
+        if backend == "claude_code":
+            return self.claude.model
+        if role == "escalation_reviewer":
+            return self.codex.checkpoint_model
+        return self.codex.review_model
+
+    def resolved_roles(self) -> dict[str, RoleAssignment]:
+        return {r: self.resolve_role(r) for r in ROLE_NAMES}
 
     def require_runnable(self) -> None:
         """Raise :class:`ConfigError` if the config cannot support an autonomous

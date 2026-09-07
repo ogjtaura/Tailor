@@ -67,6 +67,7 @@ class ClaudeInvocation:
     role: str
     result: WorkerResult
     result_text: str = ""
+    model: str = ""
     is_error: bool = False
     subtype: str = ""
     parsed: bool = True          # was the structured JSON response parseable?
@@ -140,17 +141,20 @@ class ClaudeWorker:
 
     # -- roles ------------------------------------------------------------------
 
-    def plan(self, *, objective: str, repo_context: str = "", iteration: int = 0) -> PlanResult:
+    def plan(
+        self, *, objective: str, repo_context: str = "", iteration: int = 0,
+        model: str | None = None,
+    ) -> PlanResult:
         prompt = render(
             "planner", objective=objective, repo_context=repo_context
         )
-        argv = self._base_argv(prompt, role="plan") + [
+        argv = self._base_argv(prompt, role="plan", model=model) + [
             "--permission-mode", "plan",
             "--tools", *self.config.claude.planner_tools,
             "--json-schema", _plan_schema_json(),
         ]
         argv += self._maybe_max_turns(self.config.claude.planner_max_turns)
-        inv = self._run(argv, role="plan", iteration=iteration)
+        inv = self._run(argv, role="plan", iteration=iteration, model=model)
         if inv.is_usage_limit:
             raise WorkerUsageLimitError("planner hit a usage/rate limit")
         if not inv.ok:
@@ -162,13 +166,14 @@ class ClaudeWorker:
         return _validate_plan(inv.result_text)
 
     def implement(
-        self, *, objective: str, task: str, repo_context: str = "", iteration: int = 0
+        self, *, objective: str, task: str, repo_context: str = "", iteration: int = 0,
+        model: str | None = None,
     ) -> ClaudeInvocation:
         prompt = render(
             "implementer", objective=objective, task=task, repo_context=repo_context
         )
         return self._edit_role(prompt, role="implement", iteration=iteration,
-                               max_turns=self.config.claude.implement_max_turns)
+                               max_turns=self.config.claude.implement_max_turns, model=model)
 
     def repair(
         self,
@@ -178,6 +183,7 @@ class ClaudeWorker:
         failures: str,
         root_cause: str = "",
         iteration: int = 0,
+        model: str | None = None,
     ) -> ClaudeInvocation:
         prompt = render(
             "repairer",
@@ -187,23 +193,28 @@ class ClaudeWorker:
             root_cause=root_cause,
         )
         return self._edit_role(prompt, role="repair", iteration=iteration,
-                               max_turns=self.config.claude.repair_max_turns)
+                               max_turns=self.config.claude.repair_max_turns, model=model)
 
     # -- internals ------------------------------------------------------------
 
-    def _edit_role(self, prompt: str, *, role: str, iteration: int, max_turns: int) -> ClaudeInvocation:
-        argv = self._base_argv(prompt, role=role) + [
+    def _edit_role(
+        self, prompt: str, *, role: str, iteration: int, max_turns: int, model: str | None = None
+    ) -> ClaudeInvocation:
+        argv = self._base_argv(prompt, role=role, model=model) + [
             "--permission-mode", "acceptEdits",
             "--tools", *self.config.claude.edit_tools,
         ]
         argv += self._maybe_max_turns(max_turns)
-        return self._run(argv, role=role, iteration=iteration)
+        return self._run(argv, role=role, iteration=iteration, model=model)
 
-    def _base_argv(self, prompt: str, *, role: str) -> list[str]:
+    def _model(self, model: str | None) -> str:
+        return model or self.config.claude.model
+
+    def _base_argv(self, prompt: str, *, role: str, model: str | None = None) -> list[str]:
         return [
             self._executable,
             "-p", prompt,
-            "--model", self.config.claude.model,
+            "--model", self._model(model),
             "--output-format", "json",
             "--add-dir", str(self.config.repo_root),
             "--permission-prompts", "none",
@@ -213,7 +224,9 @@ class ClaudeWorker:
     def _maybe_max_turns(self, n: int) -> list[str]:
         return ["--max-turns", str(n)] if self.max_turns_supported() else []
 
-    def _run(self, argv: list[str], *, role: str, iteration: int) -> ClaudeInvocation:
+    def _run(
+        self, argv: list[str], *, role: str, iteration: int, model: str | None = None
+    ) -> ClaudeInvocation:
         log_path = None
         if self.log_dir is not None:
             log_path = Path(self.log_dir) / f"{iteration:03d}-{role}-claude.log"
@@ -232,6 +245,7 @@ class ClaudeWorker:
             role=role,
             result=res,
             result_text=str(data.get("result", "")) if data else res.stdout,
+            model=self._model(model),
             is_error=bool(data.get("is_error", False)) if data else False,
             subtype=str(data.get("subtype", "")) if data else "",
             parsed=bool(data),

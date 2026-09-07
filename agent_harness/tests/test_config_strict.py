@@ -59,6 +59,14 @@ class StrictConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             self._load('[classify]\nusage_pattern = ["x"]\n')
 
+    def test_unknown_roles_role_rejected(self):
+        with self.assertRaises(ConfigError):
+            self._load('[roles]\nplaner = { backend = "claude_code" }\n')   # misspelled role
+
+    def test_unknown_role_assignment_field_rejected(self):
+        with self.assertRaises(ConfigError):
+            self._load('[roles]\nplanner = { backend = "claude_code", modl = "x" }\n')
+
     def test_real_agent_toml_still_loads(self):
         load_config(REPO / "agent.toml", REPO)
 
