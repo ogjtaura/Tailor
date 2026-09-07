@@ -27,8 +27,10 @@ from agent_harness.graph import Engine, Printer, recursion_budget
 from agent_harness.persistence import (
     Persistence,
     RunLockError,
+    RunManifestError,
     StateCorruptError,
     reconcile_for_resume,
+    verify_run_authorization,
 )
 from agent_harness.state import HarnessState, Status, StopReason
 
@@ -208,6 +210,19 @@ def _run_resume(cfg, git, store, printer) -> int:
         printer.info("nothing to resume: no .agent/state.json found")
         return 2
     state.stop_reason = None
+    # Re-establish this run's write authorization from the write-once manifest
+    # BEFORE any reconciliation. Never choose a new target.
+    try:
+        auth_reason = verify_run_authorization(state, store, git)
+    except RunManifestError as exc:
+        printer.info(f"resume aborted: {exc}")
+        return 2
+    if auth_reason is not None:
+        state.stop_reason = auth_reason
+        state.status = Status.STOPPED
+        store.save(state, note="resume authorization refused")
+        _summary(state, printer, store)
+        return 1
     try:
         state = reconcile_for_resume(state, git, cfg.safety.protected_paths)
     except GitError as exc:

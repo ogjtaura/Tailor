@@ -1,156 +1,154 @@
-"""Git-ownership, expected-HEAD, no-op-writer and checkpoint-guard behaviour,
-driven through the real Engine nodes with fake collaborators."""
+"""Immutable-candidate content binding + no-op handling, driven end-to-end
+through the real Engine against a REAL temporary Git repo.
 
+Because the candidate tree/commit is frozen BEFORE verify and review, a
+post-freeze working-tree / index mutation cannot change what gets committed -
+the invariant is structural, not a pre-commit recheck.
+"""
+
+import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
-from unittest import mock
 
 from agent_harness import graph as graphmod
+from agent_harness.git_tools import GitTools
 from agent_harness.graph import Engine
-from agent_harness.state import CheckResult, StopReason
-from agent_harness.tests.helpers import (
-    FakeClaude,
-    FakeCodex,
-    FakeGit,
-    RecordingStore,
-    SpyPrinter,
-    base_state,
-    make_config,
-)
+from agent_harness.persistence import Persistence
+from agent_harness.state import CheckResult, HarnessState, StopReason
+from agent_harness.tests.helpers import FakeClaude, FakeCodex, SpyPrinter, make_config
 from agent_harness.workers.claude import PlanResult, PlanTask
+from agent_harness.workers.codex import ReviewOutcome, ReviewVerdict
+from unittest import mock
 
 
-def one_task_plan():
-    return PlanResult(tasks=[PlanTask(id="T1", title="do the thing", rationale="r")])
+@contextmanager
+def repo():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        run = lambda *a: subprocess.run(["git", *a], cwd=root, check=True,
+                                        capture_output=True, text=True)
+        run("init", "-q", "-b", "agent-harness-v0")
+        run("config", "user.email", "t@e.c"); run("config", "user.name", "T")
+        (root / ".gitignore").write_text(".agent/\n")
+        (root / "app.py").write_text("v0\n")
+        (root / "tests").mkdir()
+        (root / "tests/test_x.py").write_text("def test_ok():\n    assert True\n")
+        run("add", "-A"); run("commit", "-qm", "init")
+        yield root, run
+
+
+def plan1():
+    return PlanResult(tasks=[PlanTask(id="T1", title="do it", rationale="r")])
+
+
+PASS = lambda: ReviewOutcome(kind="verdict", verdict=ReviewVerdict(verdict="pass"))
 
 
 def checks(passing):
     def _run(commands, **kw):
-        code = 0 if passing else 1
-        return [CheckResult(command="c", exit_code=code, stderr_tail="" if passing else "boom")]
+        return [CheckResult(command="c", exit_code=0 if passing else 1)]
     return _run
 
 
-class NoProgressTests(unittest.TestCase):
-    def _engine(self, root, claude):
-        cfg = make_config(root, agent={"max_iterations": 10, "max_repairs_per_task": 2,
-                                       "max_stagnant_iterations": 9})
-        git = FakeGit(root)
-        return Engine(cfg, claude=claude, codex=FakeCodex(), git=git,
-                      store=RecordingStore(root), printer=SpyPrinter()), git
+def engine(root, *, claude, codex):
+    return Engine(make_config(root, checks={"commands": ["true"]}),
+                  claude=claude, codex=codex, git=GitTools(root),
+                  store=Persistence(root), printer=SpyPrinter())
 
-    def test_noop_writer_cannot_produce_success(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            claude = FakeClaude(plan_result=one_task_plan(), on_edit=lambda _r: None)  # never edits
-            eng, git = self._engine(root, claude)
+
+class ContentBindingTests(unittest.TestCase):
+    def test_worktree_mutation_after_freeze_does_not_change_the_commit(self):
+        with repo() as (root, run):
+            def edit(_r):
+                (root / "app.py").write_text("REVIEWED CONTENT\n")
+            # Codex mutates the real working tree while "reviewing", then PASSes.
+            def review(**kw):
+                (root / "app.py").write_text("SNEAKY POST-REVIEW MUTATION\n")
+                return PASS()
+            codex = FakeCodex(); codex.review = review
+            claude = FakeClaude(plan_result=plan1(), on_edit=edit)
             with mock.patch.object(graphmod.verifier, "run_checks", checks(True)):
-                final = eng.run(base_state())
+                final = engine(root, claude=claude, codex=codex).run(
+                    HarnessState(objective="o", run_id="r"))
+            self.assertEqual(final.stop_reason, StopReason.SUCCESS)
+            tip = run("rev-parse", "refs/heads/agent-harness-v0").stdout.strip()
+            self.assertEqual(run("show", f"{tip}:app.py").stdout, "REVIEWED CONTENT\n")
+            self.assertEqual(final.commits, [tip])
+
+    def test_foreign_index_staging_after_freeze_never_enters_commit(self):
+        with repo() as (root, run):
+            def edit(_r):
+                (root / "app.py").write_text("owned change\n")
+            def review(**kw):
+                (root / "foreign.py").write_text("NOT MINE\n")
+                run("add", "foreign.py")                 # stage into the shared index
+                return PASS()
+            codex = FakeCodex(); codex.review = review
+            claude = FakeClaude(plan_result=plan1(), on_edit=edit)
+            with mock.patch.object(graphmod.verifier, "run_checks", checks(True)):
+                final = engine(root, claude=claude, codex=codex).run(
+                    HarnessState(objective="o", run_id="r"))
+            self.assertEqual(final.stop_reason, StopReason.SUCCESS)
+            tip = run("rev-parse", "refs/heads/agent-harness-v0").stdout.strip()
+            names = run("show", "--format=", "--name-only", tip).stdout.split()
+            self.assertIn("app.py", names)
+            self.assertNotIn("foreign.py", names)
+
+    def test_exec_mode_change_is_bound_into_the_candidate(self):
+        with repo() as (root, run):
+            def edit(_r):
+                import os
+                (root / "app.py").write_text("v1\n")
+                os.chmod(root / "app.py", 0o755)
+            claude = FakeClaude(plan_result=plan1(), on_edit=edit)
+            with mock.patch.object(graphmod.verifier, "run_checks", checks(True)):
+                final = engine(root, claude=claude, codex=FakeCodex(review_seq=[PASS()])).run(
+                    HarnessState(objective="o", run_id="r"))
+            self.assertEqual(final.stop_reason, StopReason.SUCCESS)
+            tip = run("rev-parse", "refs/heads/agent-harness-v0").stdout.strip()
+            self.assertEqual(run("ls-tree", tip, "app.py").stdout.split()[0], "100755")
+
+
+class NoProgressTests(unittest.TestCase):
+    def test_noop_writer_never_completes_the_task(self):
+        with repo() as (root, run):
+            claude = FakeClaude(plan_result=plan1(), on_edit=lambda _r: None)  # edits nothing
+            eng = Engine(
+                make_config(root, checks={"commands": ["true"]},
+                            agent={"max_iterations": 20, "max_repairs_per_task": 2}),
+                claude=claude, codex=FakeCodex(), git=GitTools(root),
+                store=Persistence(root), printer=SpyPrinter())
+            with mock.patch.object(graphmod.verifier, "run_checks", checks(True)):
+                final = eng.run(HarnessState(objective="o", run_id="r"))
             self.assertEqual(final.stop_reason, StopReason.NO_PROGRESS)
             self.assertEqual(final.completed_tasks, [])
             self.assertEqual(final.commits, [])
-            self.assertEqual(git.checkpoints, [])
-            self.assertNotIn("checkpoint", eng.printer.visited)
+            tip = run("rev-parse", "refs/heads/agent-harness-v0").stdout.strip()
+            self.assertEqual(run("rev-list", "--count", tip).stdout.strip(), "1")
 
-
-class ExpectedHeadTests(unittest.TestCase):
-    def _engine(self, root):
-        cfg = make_config(root)
-        git = FakeGit(root)
-        eng = Engine(cfg, claude=FakeClaude(plan_result=one_task_plan()), codex=FakeCodex(),
-                     git=git, store=RecordingStore(root), printer=SpyPrinter())
-        return eng, git
-
-    def test_writer_node_refuses_when_head_moved(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            st = base_state(current_task="t", expected_head="EXPECTED")
-            git._head = "SOMETHING_ELSE"
-            out = eng.implement(st)
-            self.assertEqual(out.stop_reason, StopReason.EXPECTED_HEAD_MOVED)
-            self.assertEqual(eng.claude.calls, [])  # writer never invoked
-
-    def test_writer_node_refuses_unrelated_preexisting_changes(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.write("someone_elses.py", "not ours\n")
-            st = base_state(current_task="t", expected_head=git.head(), owned_paths=[])
-            out = eng.implement(st)
-            self.assertEqual(out.stop_reason, StopReason.UNEXPECTED_WORKTREE_STATE)
-            self.assertEqual(eng.claude.calls, [])
-
-    def test_checkpoint_refuses_when_head_moved(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.set_changed(["src/x.py"])
-            st = base_state(current_task="t", checks_passed=True, review_status="pass",
-                            owned_paths=["src/x.py"], reviewed_paths=["src/x.py"],
-                            expected_head="EXPECTED")
-            git._head = "MOVED"
-            out = eng.checkpoint(st)
-            self.assertEqual(out.stop_reason, StopReason.EXPECTED_HEAD_MOVED)
-            self.assertEqual(git.checkpoints, [])
-
-    def test_checkpoint_refuses_detached_head(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.set_changed(["src/x.py"])
-            git.set_detached(True)
-            st = base_state(current_task="t", checks_passed=True, review_status="pass",
-                            owned_paths=["src/x.py"], reviewed_paths=["src/x.py"],
-                            expected_head=git.head())
-            out = eng.checkpoint(st)
-            self.assertEqual(out.stop_reason, StopReason.DETACHED_HEAD)
-            self.assertEqual(git.checkpoints, [])
-
-    def test_checkpoint_revalidates_branch(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.set_changed(["src/x.py"])
-            git.set_branch("main")
-            st = base_state(current_task="t", checks_passed=True, review_status="pass",
-                            owned_paths=["src/x.py"], reviewed_paths=["src/x.py"],
-                            expected_head=git.head())
-            out = eng.checkpoint(st)
-            self.assertIsNotNone(out.stop_reason)
-            self.assertEqual(git.checkpoints, [])  # never committed onto main
-
-    def test_checkpoint_refuses_unowned_changes(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.set_changed(["src/x.py"])
-            git.write("stray.py", "not owned\n")
-            st = base_state(current_task="t", checks_passed=True, review_status="pass",
-                            owned_paths=["src/x.py"], reviewed_paths=["src/x.py"],
-                            expected_head=git.head())
-            out = eng.checkpoint(st)
-            self.assertEqual(out.stop_reason, StopReason.UNEXPECTED_WORKTREE_STATE)
-            self.assertEqual(git.checkpoints, [])
-
-    def test_checkpoint_refuses_unreviewed_owned_path(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.set_changed(["src/x.py", "src/y.py"])
-            st = base_state(current_task="t", checks_passed=True, review_status="pass",
-                            owned_paths=["src/x.py", "src/y.py"], reviewed_paths=["src/x.py"],
-                            expected_head=git.head())
-            out = eng.checkpoint(st)
-            self.assertEqual(out.stop_reason, StopReason.REVIEW_COVERAGE_GAP)
-            self.assertEqual(git.checkpoints, [])
-
-    def test_expected_head_advances_after_commit(self):
-        with tempfile.TemporaryDirectory() as d:
-            eng, git = self._engine(Path(d))
-            git.set_changed(["src/x.py"])
-            st = base_state(current_task="t", checks_passed=True, review_status="pass",
-                            owned_paths=["src/x.py"], reviewed_paths=["src/x.py"],
-                            expected_head=git.head(), remaining_tasks=["next task"])
-            out = eng.checkpoint(st)
-            self.assertEqual(len(git.checkpoints), 1)
-            self.assertEqual(out.expected_head, git.head())
-            self.assertEqual(out.completed_tasks, ["t"])
-            self.assertEqual(out.next_node, "plan")
+    def test_writer_reverting_its_own_change_is_a_noop(self):
+        with repo() as (root, run):
+            calls = {"n": 0}
+            def edit(_r):
+                calls["n"] += 1
+                # first attempt changes app.py, later "repairs" revert it to v0
+                (root / "app.py").write_text("changed\n" if calls["n"] == 1 else "v0\n")
+            eng = Engine(
+                make_config(root, checks={"commands": ["true"]},
+                            agent={"max_iterations": 20, "max_repairs_per_task": 2}),
+                claude=FakeClaude(plan_result=plan1(), on_edit=edit),
+                codex=FakeCodex(review_seq=[ReviewOutcome(kind="verdict",
+                                 verdict=ReviewVerdict(verdict="fail", severity="major",
+                                 findings=[__import__("agent_harness.workers.codex",
+                                 fromlist=["ReviewFinding"]).ReviewFinding(id="F1", description="x")]))]),
+                git=GitTools(root), store=Persistence(root), printer=SpyPrinter())
+            with mock.patch.object(graphmod.verifier, "run_checks", checks(True)):
+                final = eng.run(HarnessState(objective="o", run_id="r"))
+            # after the revert, freeze sees candidate tree == parent tree -> no-op
+            self.assertEqual(final.stop_reason, StopReason.NO_PROGRESS)
+            self.assertEqual(final.commits, [])
 
 
 if __name__ == "__main__":

@@ -136,6 +136,41 @@ class ClaudeWorkerTests(unittest.TestCase):
         with self.assertRaises(WorkerUsageLimitError):
             w.plan(objective="o")
 
+    def test_structured_is_error_true_makes_invocation_not_ok(self):
+        # exit 0, valid JSON, but is_error: true
+        body = json.dumps({"result": "sorry", "is_error": True, "subtype": "error_during_execution"})
+        w, _ = self._worker(worker_result(stdout=body, exit_code=0, ok=True))
+        inv = w.implement(objective="o", task="t")
+        self.assertFalse(inv.ok)
+        self.assertTrue(inv.is_error)
+        self.assertFalse(inv.is_usage_limit)
+
+    def test_structured_usage_limit_subtype_is_usage_limit(self):
+        body = json.dumps({"result": "", "is_error": True, "subtype": "usage_limit_reached"})
+        w, _ = self._worker(worker_result(stdout=body, exit_code=0, ok=True))
+        inv = w.implement(objective="o", task="t")
+        self.assertFalse(inv.ok)
+        self.assertTrue(inv.is_usage_limit)
+
+    def test_unparseable_output_is_not_ok_even_on_exit_zero(self):
+        w, _ = self._worker(worker_result(stdout="not json at all", exit_code=0, ok=True))
+        inv = w.implement(objective="o", task="t")
+        self.assertFalse(inv.parsed)
+        self.assertFalse(inv.ok)
+
+    def test_plan_is_error_true_raises_planning_error(self):
+        body = json.dumps({"result": '{"tasks":[{"id":"T1","title":"x","rationale":"y"}]}',
+                           "is_error": True, "subtype": "error_during_execution"})
+        w, _ = self._worker(worker_result(stdout=body, exit_code=0, ok=True))
+        with self.assertRaises(PlanningError):
+            w.plan(objective="o")
+
+    def test_plan_is_error_usage_subtype_raises_usage_limit(self):
+        body = json.dumps({"result": "", "is_error": True, "subtype": "rate_limit"})
+        w, _ = self._worker(worker_result(stdout=body, exit_code=0, ok=True))
+        with self.assertRaises(WorkerUsageLimitError):
+            w.plan(objective="o")
+
 
 if __name__ == "__main__":
     unittest.main()

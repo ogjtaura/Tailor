@@ -52,21 +52,60 @@ class ReconcileResumeTests(unittest.TestCase):
         g.set_changed(changed)
         return g
 
-    def test_write_worker_in_flight_routes_to_verify(self):
+    def test_interrupted_writer_with_any_mutation_fails_closed(self):
+        # Section 9: from a shared worktree we cannot prove a mutation is
+        # Claude's vs a concurrent human edit -> ANY delta since the writer
+        # started fails closed. The writer is NEVER replayed.
         with tempfile.TemporaryDirectory() as d:
-            s = _state(worker_in_flight="claude_implement", owned_paths=["src/x.py"])
-            g = self._git(d, ["src/x.py"])
+            s = _state(worker_in_flight="claude_implement", owned_paths=[],
+                       pre_writer_paths=[], pre_writer_hashes={})
+            g = self._git(d, ["src/x.py"])                 # something changed
             out = reconcile_for_resume(s, g, ["agent_harness/", ".git/"])
-            self.assertIsNone(out.stop_reason)
-            self.assertEqual(out.next_node, "verify")
-            self.assertIsNone(out.worker_in_flight)
+            self.assertEqual(out.stop_reason, StopReason.INTERRUPTED_WRITE_UNATTRIBUTABLE)
+            self.assertIsNone(out.next_node)
 
-    def test_unexpected_change_stops(self):
+    def test_interrupted_writer_new_untracked_file_also_fails_closed(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _state(worker_in_flight="claude_repair", owned_paths=["src/x.py"])
-            g = self._git(d, ["src/x.py", "src/surprise.py"])
+            g = self._git(d, ["src/x.py"])
+            pre = g.snapshot(["src/x.py"])
+            s = _state(worker_in_flight="claude_repair", owned_paths=["src/x.py"],
+                       pre_writer_paths=["src/x.py"], pre_writer_hashes=dict(pre.hashes))
+            g.write("brand_new.py", "half written\n", untracked=True)
             out = reconcile_for_resume(s, g, ["agent_harness/"])
-            self.assertEqual(out.stop_reason, StopReason.UNEXPECTED_WORKTREE_STATE)
+            self.assertEqual(out.stop_reason, StopReason.INTERRUPTED_WRITE_UNATTRIBUTABLE)
+
+    def test_interrupted_writer_further_mutating_an_owned_file_fails_closed(self):
+        # The writer was mid-repair on an already-owned file and crashed. We
+        # cannot prove the on-disk content is Claude's final output vs a partial
+        # write vs a concurrent human edit -> fail closed, never route to VERIFY.
+        with tempfile.TemporaryDirectory() as d:
+            g = self._git(d, ["src/x.py"])
+            pre = g.snapshot(["src/x.py"])
+            s = _state(worker_in_flight="claude_repair", owned_paths=["src/x.py"],
+                       pre_writer_paths=["src/x.py"], pre_writer_hashes=dict(pre.hashes))
+            g.set_changed(["src/x.py"])                 # content moved again after the snapshot
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertEqual(out.stop_reason, StopReason.INTERRUPTED_WRITE_UNATTRIBUTABLE)
+            self.assertIsNone(out.next_node)
+            self.assertEqual(out.owned_paths, ["src/x.py"])   # ownership NOT expanded
+
+    def test_interrupted_writer_with_no_observable_change_resumes_freeze(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self._git(d, [])                            # nothing changed on disk
+            s = _state(worker_in_flight="claude_repair", owned_paths=["src/x.py"],
+                       pre_writer_paths=[], pre_writer_hashes={})
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertIsNone(out.stop_reason)
+            self.assertEqual(out.next_node, "freeze")       # owned -> re-freeze + re-verify
+
+    def test_interrupted_first_writer_no_change_reruns_implement(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self._git(d, [])
+            s = _state(worker_in_flight="claude_implement", owned_paths=[],
+                       pre_writer_paths=[], pre_writer_hashes={})
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertIsNone(out.stop_reason)
+            self.assertEqual(out.next_node, "implement")
 
     def test_protected_change_stops(self):
         with tempfile.TemporaryDirectory() as d:
@@ -82,11 +121,18 @@ class ReconcileResumeTests(unittest.TestCase):
             self.assertEqual(out.next_node, "review")
             self.assertIsNone(out.worker_in_flight)
 
-    def test_no_worker_in_flight_uses_next_node(self):
+    def test_no_worker_in_flight_derives_from_last_completed_node(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _state(worker_in_flight=None, next_node="decide")
+            # raw next_node is NOT trusted; re-entry derives from last_completed_node
+            s = _state(worker_in_flight=None, next_node="escalate", last_completed_node="verify")
             out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
-            self.assertEqual(out.next_node, "decide")
+            self.assertEqual(out.next_node, "decide")   # _AFTER_NODE["verify"]
+
+    def test_every_after_node_target_is_resumable(self):
+        from agent_harness.persistence import _AFTER_NODE
+        from agent_harness.state import RESUMABLE_NODES
+        for src, target in _AFTER_NODE.items():
+            self.assertIn(target, RESUMABLE_NODES, msg=f"{src!r} -> {target!r} not resumable")
 
     def test_planner_in_flight_reruns_plan(self):
         with tempfile.TemporaryDirectory() as d:
@@ -101,17 +147,60 @@ class ReconcileResumeTests(unittest.TestCase):
             out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
             self.assertEqual(out.stop_reason, StopReason.UNSAFE_RESUME_STATE)
 
-    def test_checkpoint_intent_routes_to_checkpoint(self):
+    def test_reviewed_phase_routes_to_checkpoint_when_ref_at_parent(self):
         with tempfile.TemporaryDirectory() as d:
-            s = _state(checkpoint_status="intended", checkpoint_pre_head="abc",
-                       next_node="decide")
-            out = reconcile_for_resume(s, self._git(d, []), ["agent_harness/"])
+            g = self._git(d, [])
+            ref, parent = g._head_ref, g.head()
+            # fabricate a candidate object in the fake object store
+            tree = g._tree_of({"src/x.py": "candidate"})
+            commit = g.commit_tree(tree_oid=tree, parent=parent, message="m",
+                                   author=["h", "h", "0"], committer=["h", "h", "0"])
+            s = _state(checkpoint_phase="reviewed", checkpoint_target_ref=ref,
+                       checkpoint_expected_parent=parent, candidate_tree_oid=tree,
+                       candidate_commit_oid=commit, verified_tree_oid=tree,
+                       verified_commit_oid=commit, reviewed_commit_oid=commit,
+                       reviewed_tree_oid=tree, next_node="decide")
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertIsNone(out.stop_reason)
             self.assertEqual(out.next_node, "checkpoint")
+
+    def test_reviewed_phase_ref_at_candidate_means_cas_landed(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self._git(d, [])
+            ref, parent = g._head_ref, g.head()
+            tree = g._tree_of({"src/x.py": "candidate"})
+            commit = g.commit_tree(tree_oid=tree, parent=parent, message="m",
+                                   author=["h", "h", "0"], committer=["h", "h", "0"])
+            g._refs[ref] = commit                                  # CAS already happened
+            s = _state(checkpoint_phase="reviewed", checkpoint_target_ref=ref,
+                       checkpoint_expected_parent=parent, candidate_tree_oid=tree,
+                       candidate_commit_oid=commit, verified_tree_oid=tree,
+                       verified_commit_oid=commit, reviewed_commit_oid=commit,
+                       reviewed_tree_oid=tree)
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertEqual(out.checkpoint_phase, "ref_updated")
+            self.assertEqual(out.next_node, "checkpoint")
+
+    def test_reviewed_phase_foreign_ref_move_conflicts(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self._git(d, [])
+            ref, parent = g._head_ref, g.head()
+            tree = g._tree_of({"src/x.py": "candidate"})
+            commit = g.commit_tree(tree_oid=tree, parent=parent, message="m",
+                                   author=["h", "h", "0"], committer=["h", "h", "0"])
+            g._refs[ref] = "somethingelse" * 3
+            s = _state(checkpoint_phase="reviewed", checkpoint_target_ref=ref,
+                       checkpoint_expected_parent=parent, candidate_tree_oid=tree,
+                       candidate_commit_oid=commit, verified_tree_oid=tree,
+                       verified_commit_oid=commit, reviewed_commit_oid=commit,
+                       reviewed_tree_oid=tree)
+            out = reconcile_for_resume(s, g, ["agent_harness/"])
+            self.assertEqual(out.stop_reason, StopReason.REF_UPDATE_CONFLICT)
 
     def test_expected_head_moved_externally_stops(self):
         with tempfile.TemporaryDirectory() as d:
             g = self._git(d, [])
-            g._head = "actualHEAD"
+            g._refs[g._head_ref] = "actualHEAD"
             s = _state(worker_in_flight=None, next_node="verify", expected_head="oldHEAD")
             out = reconcile_for_resume(s, g, ["agent_harness/"])
             self.assertEqual(out.stop_reason, StopReason.EXPECTED_HEAD_MOVED)

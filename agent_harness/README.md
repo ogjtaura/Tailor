@@ -41,18 +41,20 @@ performed. Activate deliberately.
 ```mermaid
 flowchart TD
     START([start]) --> bootstrap
-    bootstrap -->|dirty tree / not a repo| STOP([END])
+    bootstrap -->|dirty tree / not a repo / detached| STOP([END])
     bootstrap --> plan
     plan -->|iteration limit / planning failed| STOP
     plan --> implement
     implement -->|protected path / usage limit / CLI fatal| STOP
-    implement --> verify
+    implement --> freeze
+    repair --> freeze
+    freeze -->|no candidate: no-op writer| decide
+    freeze -->|immutable candidate tree + commit| verify
     verify --> decide
 
     decide -->|checks fail, repairs left| repair
     decide -->|checks fail, stagnant| escalation_review
-    decide -->|checks fail, repairs exhausted| STOP
-    decide -->|checks fail, iteration limit| STOP
+    decide -->|checks/repair/iteration/no-progress limit| STOP
     decide -->|checks pass, review pending| review
     decide -->|reviewer infra error, retries left| review
     decide -->|reviewer infra error, exhausted| STOP
@@ -60,25 +62,57 @@ flowchart TD
     decide -->|review PASS verdict| checkpoint
 
     review --> decide
-    repair --> verify
     escalation_review --> repair
-    checkpoint -->|more tasks| plan
+    checkpoint -->|CAS the feature ref, more tasks| plan
     checkpoint -->|objective complete| STOP
 ```
 
 Loops live entirely in edges — nodes never recurse. `decide` is the only
-router; because LangGraph does not persist mutations made inside conditional
-edge functions, the routing decision (and any stop reason) is computed in the
-`decide` **node** and merely read by the edge function.
+router; the routing decision (and any stop reason) is computed in the `decide`
+**node** and merely read by the edge function.
+
+### The checkpoint boundary is immutable Git objects (V0.1c)
+
+`freeze` builds `<parent tree> + owned pathspec` in an **index isolated from the
+user's `.git/index`** (`GIT_INDEX_FILE`) → `write-tree` → `candidate_tree_oid` →
+`commit-tree` (deterministic author/committer) → `candidate_commit_oid` (an
+unreachable object; the feature ref is untouched). `verify` runs the checks
+against that exact commit in a throwaway `git worktree`. `review` diffs
+`parent → candidate_commit`. `checkpoint` **atomically advances the persisted
+feature-branch ref** with `git update-ref <ref> <candidate> <expected_parent>`
+(compare-and-swap) — never `git add`/`git commit`, never the checked-out
+branch, **never `refs/heads/main` or `refs/heads/master`**. Phases:
+`none → candidate_frozen → verified → reviewed → ref_update_intent →
+ref_updated`. The deterministic commit spec (parent, message, author,
+committer) is persisted *together with* `candidate_tree_oid` at
+`candidate_frozen`, so a crash before `candidate_commit_oid` is written rebuilds
+the commit **from the frozen tree**, never from the (possibly drifted) working
+tree. Verify and review evidence is bound to the exact
+`(candidate_tree_oid, candidate_commit_oid)` pair.
 
 ### Stop reasons
 
 `SUCCESS`, `ITERATION_LIMIT`, `REPAIR_LIMIT`, `NO_PROGRESS`,
 `STAGNATION_UNRESOLVED`, `PLANNING_FAILED`, `REVIEWER_ERROR`,
-`REVIEW_COVERAGE_GAP`, `PROTECTED_PATH_MODIFIED`, `DIRTY_WORKTREE`,
-`UNEXPECTED_WORKTREE_STATE`, `EXPECTED_HEAD_MOVED`, `DETACHED_HEAD`,
-`CONFIG_INVALID`, `UNSAFE_RESUME_STATE`, `STATE_CORRUPT`, `CLI_FATAL`,
-`USAGE_LIMIT`, `USER_ABORT`.
+`REVIEW_COVERAGE_GAP`, `REVIEW_INVALIDATED`, `REVIEW_PAYLOAD_ERROR`,
+`CANDIDATE_INVALID`, `INVALID_CHECKPOINT_STATE`, `PROTECTED_BRANCH`,
+`RUN_AUTHORIZATION_MISSING`, `RUN_AUTHORIZATION_INVALID`,
+`REF_UPDATE_CONFLICT`, `INTERRUPTED_WRITE_UNATTRIBUTABLE`,
+`PROTECTED_PATH_MODIFIED`, `DIRTY_WORKTREE`, `UNEXPECTED_WORKTREE_STATE`,
+`EXPECTED_HEAD_MOVED`, `DETACHED_HEAD`, `CONFIG_INVALID`,
+`UNSAFE_RESUME_STATE`, `STATE_CORRUPT`, `CLI_FATAL`, `USAGE_LIMIT`,
+`USER_ABORT`.
+
+- `PROTECTED_BRANCH` — the run's write target resolved to `main`/`master`.
+  This is an **invariant**: `git_tools.is_protected_target_ref()` is consulted at
+  fresh bootstrap, when the target ref is first persisted (`freeze`), on
+  resume/load, immediately before the CAS, and inside `cas_update_ref` itself.
+  No config value (`branch_required` included), CLI override, resume state, or
+  checked-out branch can bypass it. Read-only `--dry-run` is still fine on main.
+- `INVALID_CHECKPOINT_STATE` — persisted checkpoint state is internally
+  inconsistent (e.g. `candidate_tree_oid` with no recoverable commit spec, or a
+  landed ref whose commit OID is not the persisted candidate). Never
+  auto-repaired; the state file is left for inspection.
 
 ### V0.1 hardening (safe-for-one-guided-run pass)
 
@@ -118,6 +152,187 @@ edge functions, the routing decision (and any stop reason) is computed in the
   process exits cleanly. The kernel frees it if the holder dies.
 - **Corrupt `.agent/state.json`** raises `STATE_CORRUPT` on resume and is left
   untouched for inspection.
+
+### V0.1b hardening (second adversarial-review pass)
+
+- **Content-bound verify → review → checkpoint.** `git.owned_digest()` is a
+  SHA-256 over sorted `path\0(blob:sha256 | absent)` records for every owned
+  path (covers modified / deleted / new / renamed). `verify` records
+  `verified_digest` on pass; `review` refuses if the worktree drifted since
+  verification and, on PASS, records `reviewed_digest`; `checkpoint` commits
+  only if the current digest equals **both**. Any post-review mutation →
+  `REVIEW_INVALIDATED`, fail-closed, no commit.
+- **Review payload is fail-closed.** If `review_diff()` cannot be built, or is
+  empty while owned changes exist, the run stops `REVIEW_PAYLOAD_ERROR` — Codex
+  is never called with a fallback/empty diff, nothing is marked reviewed, no
+  checkpoint.
+- **Post-commit crash resume is HEAD-exact.** A persisted `committed` checkpoint
+  completes bookkeeping only if `git.head() == checkpoint_result_head` (and
+  `expected_head` is consistent); otherwise `UNEXPECTED_WORKTREE_STATE`, no
+  bookkeeping, no re-commit, no reset. The `intended`-state adoption path
+  requires the commit's sole parent to be `checkpoint_pre_head` **and** its
+  subject to be the exact recorded `checkpoint_message`.
+- **Claude structured errors are failures.** `ClaudeInvocation.ok` now also
+  requires the JSON response to have parsed and `is_error` to be false; a
+  usage-limit *subtype* is treated like a classified usage limit. An exit-0
+  `is_error:true` implementation cannot be verified, reviewed, or checkpointed;
+  its on-disk edits are preserved, never discarded.
+- **Resumable-node contract is single-sourced.** `state.RESUMABLE_NODES` is the
+  only list; `graph.build()` derives the bootstrap resume edge-map from it, and
+  `reconcile_for_resume` derives the re-entry node from `last_completed_node`
+  via `_AFTER_NODE` (never a raw edge key). Unknown/corrupt → `UNSAFE_RESUME_STATE`.
+- **Interrupted-writer resume uses the pre-writer snapshot** (see V0.1c for the
+  stricter, fail-closed version).
+
+### V0.1c hardening (third adversarial-review pass) — immutable-object checkpoint
+
+- **Git tree/commit OID is the content identity**, replacing the byte-only
+  `owned_digest`. It inherently binds path, blob, **file mode** (`100644` ↔
+  `100755`), **symlink** representation (`120000`), presence/deletion and
+  directory structure. `verify_tree == review_tree == candidate_tree` is
+  enforced by OID equality; `owned_digest` remains only as a diagnostic.
+- **The user's `.git/index` is irrelevant to the checkpoint.** The candidate is
+  assembled in an isolated index containing `<parent tree> + owned pathspec`
+  only. A concurrently `git add`-ed foreign file can never enter the candidate
+  tree, the review payload, or the commit.
+- **Verify and review run against the frozen candidate**, not the mutable
+  working tree. A post-freeze worktree edit, index change, mode flip or branch
+  switch cannot change what is committed — the invariant is structural.
+- **Final accept = atomic CAS of the persisted feature ref**
+  (`git update-ref <ref> <candidate> <expected_parent>`). If the ref moved,
+  the CAS fails and the run stops (`REF_UPDATE_CONFLICT`) — no adoption, no
+  retry-blind, no reset. An external switch to `main` cannot cause a write to
+  `main`; only the persisted `refs/heads/<feature>` is ever advanced.
+- **No heuristic commit adoption.** Resume compares exact persisted OIDs
+  (`candidate_commit_oid`, `candidate_tree_oid`, `checkpoint_expected_parent`,
+  `checkpoint_target_ref`). A forged commit with the same parent + message but a
+  different tree has a different OID and is rejected. `commit_tree_of(candidate)
+  != candidate_tree_oid` → `CANDIDATE_INVALID`.
+- **Crash windows** are `candidate_frozen` (commit maybe not yet made — re-run
+  `commit-tree` deterministically), `verified`, `reviewed`, `ref_update_intent`
+  (CAS may have landed — reconcile by exact ref value), `ref_updated`
+  (bookkeeping only, ref must still equal our candidate).
+- **Interrupted writer fails closed.** From a shared working tree the harness
+  cannot prove a mutation is Claude's rather than a concurrent human edit, so
+  **any** delta since the writer started →
+  `INTERRUPTED_WRITE_UNATTRIBUTABLE`; changed paths are never silently adopted;
+  user edits are never discarded. Only a writer that left no observable change
+  resumes (to `freeze`, or `implement` if nothing was owned yet).
+- **Strict config.** Every config model is `extra="forbid"`; a misspelled key
+  (`protected_path`, `max_iteration`, …) is a `CONFIG_INVALID` load error.
+- **Run-log hygiene.** `.agent/` is `0o700`, its files `0o600` (they may hold
+  prompts, diffs, model output, source fragments; credentials are already
+  scrubbed from the worker env). Checkpoint never stages `.agent/`.
+
+### V0.1d hardening (fourth adversarial-review pass)
+
+- **`main`/`master` is a permanent non-target.** One helper,
+  `git_tools.is_protected_target_ref(ref)` (matches `main`, `master`,
+  `refs/heads/main`, `refs/heads/master`), gates every write-enabled acceptance
+  path: fresh bootstrap, first persistence of `checkpoint_target_ref` in
+  `freeze`, `reconcile_for_resume`/load, the checkpoint node's CAS
+  preconditions, and `cas_update_ref` itself. A persisted
+  `target_branch_ref = refs/heads/main` **fails closed on resume**
+  (`PROTECTED_BRANCH`) — it is never reinterpreted as another branch and HEAD is
+  never consulted to infer one. `branch_required` keeps its separate meaning but
+  cannot override this.
+- **A frozen tree is immutable truth across a tree→commit crash.** The full
+  deterministic commit spec (`checkpoint_expected_parent`, `checkpoint_message`,
+  `checkpoint_author`, `checkpoint_committer`) is persisted at the same instant
+  as `candidate_tree_oid` (`candidate_frozen`). If the process dies before
+  `candidate_commit_oid` is written, resume re-enters `freeze`, which detects
+  `tree ∧ ¬commit` and rebuilds the commit **with `git commit-tree` from the
+  persisted tree OID + persisted spec** — it never rebuilds an index, never
+  inspects the working tree, never re-runs freeze-from-worktree. Missing or
+  malformed spec → `INVALID_CHECKPOINT_STATE`, fail closed, ref untouched.
+- **Verify and review bind tree *and* commit OID.** New state fields
+  `verified_commit_oid` / `reviewed_commit_oid` join `verified_tree_oid` /
+  `reviewed_tree_oid`. The CAS runs only if
+  `verified_{tree,commit} == reviewed_{tree,commit} == candidate_{tree,commit}`,
+  `checks_passed is True`, `review_status == "pass"`, and the Git object
+  relationships hold (`commit_tree_of(candidate) == candidate_tree_oid`,
+  `commit_parents(candidate) == [expected_parent]`). A new candidate produced by
+  a repair clears **all** prior evidence via one helper,
+  `state.clear_candidate_evidence()` — a PASS from candidate A can never
+  authorise candidate B.
+- **Resume after CAS is exact-OID only.** `target == candidate_commit_oid` →
+  already accepted, validate object/evidence relationships and finish
+  bookkeeping. `target == expected_parent` → not yet accepted, continue by
+  phase. Anything else → fail closed. No subject/parent/author/timestamp/filename
+  heuristics.
+- **Lexical path safety.** Candidate-construction path validation no longer calls
+  `Path.resolve()` (which follows the final symlink). `path_is_repo_safe()`
+  checks the repository *entry path* syntactically — rejects absolute paths,
+  `..` traversal, and `.git/` components — so an in-repo symlink whose target is
+  outside the repo (or dangling) freezes correctly as a mode-`120000` tree
+  entry, exactly as Git models it.
+- **Interrupted writer stays conservative.** From a shared worktree, *any*
+  content delta since a write-capable worker started — or any changed path not
+  already owned, or an un-snapshottable tree — →
+  `INTERRUPTED_WRITE_UNATTRIBUTABLE`. Ownership is never expanded, files are
+  never reset/discarded/adopted, and the model is never replayed. Only a writer
+  that left the tree byte-identical to its pre-writer snapshot resumes.
+- **Cross-field state validation.** `HarnessState` has a `model_validator` that
+  rejects impossible persisted combinations (commit without tree, evidence OID
+  ≠ candidate OID, `ref_updated` with no commit, `reviewed` phase with no bound
+  PASS, …). Malformed state raises on load and is left untouched — never
+  repaired.
+
+### V0.1e hardening (fifth adversarial-review pass) — ref-policy hardening
+
+- **One canonical target validator.** `GitTools.validate_checkpoint_target_ref()`
+  is the single gate for "may the harness advance `<ref>`?": fully-qualified
+  `refs/heads/<name>` only (not `HEAD`, not a bare name, not tags/remotes),
+  well-formed per `git check-ref-format`, never `main`/`master`, and
+  **never a symbolic ref**. It is called at bootstrap, freeze, resume,
+  before verify/review, in the checkpoint node, and *inside* `cas_update_ref`.
+- **Symbolic feature refs can't redirect the CAS.** A target like
+  `refs/heads/feature -> refs/heads/main` is refused by the validator; and the
+  CAS primitive is now `git update-ref --no-deref <ref> <new> <old>`, so even a
+  validate→write race can only ever rewrite the named ref itself — it can
+  **never** advance its referent (`main`/`master`). Real-Git tests exercise the
+  actual command, not just the Python predicate.
+- **Authorized run target.** Fresh bootstrap records the one feature ref this run
+  may advance in a write-once `.agent/runs/<run_id>/manifest.json`
+  (`authorized_target_ref`, `initial_target_oid`) and on `state.run_target_ref`.
+  `freeze` and `checkpoint` take the target from `run_target_ref` — never from
+  the checked-out branch, `checkpoint_target_ref` alone, `expected_parent`, or
+  candidate metadata. `checkpoint_target_ref` must always equal `run_target_ref`
+  (model-validated) or the run stops `INVALID_CHECKPOINT_STATE`. Expected-parent
+  equality is *not* sufficient authorization — two branches can share a commit.
+- **Resume re-authorizes from the manifest — one strict typed parser, fail
+  closed, never healed.** The run manifest has exactly one schema, the Pydantic
+  `persistence.RunManifest` model (`extra="forbid"`, `strict=True`): `version`
+  (`Literal[1]`, no bool/float/str coercion), `run_id` (non-blank str),
+  `authorized_target_ref` (non-blank str), `initial_target_oid` (40- or
+  64-char hex), `created_at` (ISO-8601 str). `Persistence.read_run_manifest()`
+  is the **only** runtime parser and does exactly
+  `bytes → RunManifest.model_validate_json → typed object` — no handwritten
+  "check a few keys" fallback. `create_run_manifest()` serialises the **same**
+  model, so writer schema == reader schema, and is fresh-bootstrap-only /
+  write-once. On resume the manifest is *required*: absent →
+  `RUN_AUTHORIZATION_MISSING`; unreadable / invalid JSON / non-object root /
+  missing or extra field / wrong type / unsupported version / malformed
+  OID or timestamp / wrong `run_id` / **any** disagreement with the persisted
+  `run_target_ref` / `checkpoint_target_ref` → `RUN_AUTHORIZATION_INVALID`.
+  No `ValidationError` / `JSONDecodeError` / `AttributeError` / `TypeError` /
+  `KeyError` ever escapes the resume path — all become the controlled stop, with
+  no ref touched, no manifest rewrite and no worker invoked. Authorization is
+  *never* inferred from mutable state (`run_target_ref`,
+  `checkpoint_target_ref`, HEAD, expected parent, candidate metadata) and the
+  manifest is *never* (re)created from it — a run without a manifest is not
+  migrated, it stops. The manifest's `authorized_target_ref` still has to pass
+  every ref-safety invariant (direct, non-symbolic, `refs/heads/`, not
+  main/master, live).
+- **Wrong-parent candidate fails before paid work.**
+  `GitTools.validate_candidate_identity(C, T, P)` (object types, `tree(C)==T`,
+  `parents(C)==[P]`) runs in `verify` before the checks are materialised and in
+  `review` before the Codex payload is built — an invalid candidate never
+  reaches the deterministic gate or the paid reviewer. The final CAS keeps its
+  own copy of the check as defence in depth.
+- **Checkout switch is conservative.** If the working checkout is moved off the
+  authorized run target mid-run, `freeze` stops (`EXPECTED_HEAD_MOVED`) rather
+  than freeze content that no longer represents the feature branch.
 
 ## Setup
 
@@ -229,11 +444,23 @@ with a clean tree.
   schema-valid verdicts, not prose.
 - LangGraph pulls `langchain-core` transitively — present but unused for model
   calls (all model access is CLI subprocess).
-- **Concurrent same-file editing** by a human during a run cannot be attributed
-  and stops the run conservatively (`UNEXPECTED_WORKTREE_STATE`). A dedicated
-  per-run git worktree is the planned stronger isolation model.
-- The "adopt an already-made commit" resume path matches on commit parent + a
-  `[run <id>]` message marker; a hand-crafted matching commit could be adopted.
-- End-to-end proof so far is `--dry-run`, the full mocked suite, the real
-  configured checks, and one real read-only Codex review. A single **guided**
-  end-to-end run is the next stage — not unattended operation.
+- **Interrupted-writer recovery is intentionally weak.** From a shared working
+  tree, ownership of partially applied changes cannot be proven, so *any*
+  mutation present after an interrupted write-capable worker stops the run
+  (`INTERRUPTED_WRITE_UNATTRIBUTABLE`). V0.1 does not support transparent
+  recovery from an interrupted shared-worktree writer. Dedicated per-run Git
+  worktrees / sandboxes are the planned fix.
+- **The candidate is built from the *current* working tree** at freeze time, so
+  a concurrent human edit made *before* `freeze` (but after `bootstrap`'s
+  clean-tree check) to an owned path would be folded into the candidate; it
+  would then be verified and reviewed as though it were Claude's. The
+  `_write_worker` pre-writer check catches unowned concurrent changes; owned
+  ones are the residual gap.
+- `commit-tree` reproducibility relies on `run_id` uniqueness for the message
+  marker; a repo where two runs reuse the same `run_id` could confuse the
+  message string (identity checks still use OIDs, not the message).
+- `owned_digest` is retained as a diagnostic only; it is *not* consulted for any
+  accept/reject decision.
+- End-to-end proof: `--dry-run`, the full mocked + real-temp-Git suite, the real
+  configured checks, `compileall`. No real Claude/Codex CLI was invoked. A
+  single **guided** end-to-end run is the next stage — not unattended operation.

@@ -1,11 +1,14 @@
 import unittest
 
+import pydantic
+
 from agent_harness.state import (
     CheckResult,
     Finding,
     HarnessState,
     Status,
     StopReason,
+    clear_candidate_evidence,
     failure_fingerprint,
     is_stagnant,
     update_stagnation,
@@ -50,37 +53,112 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(s.failing_checks(), [])
 
 
+class CheckpointInvariantTests(unittest.TestCase):
+    """Finding 11: impossible persisted checkpoint state is rejected on
+    construction / load - never silently repaired."""
+
+    def _ok(self, **kw):
+        return _state(**kw)
+
+    def test_valid_reviewed_state_constructs(self):
+        self._ok(checkpoint_phase="reviewed", candidate_tree_oid="t", candidate_commit_oid="c",
+                 verified_tree_oid="t", verified_commit_oid="c",
+                 reviewed_tree_oid="t", reviewed_commit_oid="c")
+
+    def test_commit_without_tree_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(candidate_commit_oid="c")
+
+    def test_reviewed_commit_without_candidate_commit_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(candidate_tree_oid="t", reviewed_tree_oid="t", reviewed_commit_oid="c")
+
+    def test_verified_commit_mismatch_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(candidate_tree_oid="t", candidate_commit_oid="c",
+                     verified_tree_oid="t", verified_commit_oid="OTHER")
+
+    def test_reviewed_tree_mismatch_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(candidate_tree_oid="t", candidate_commit_oid="c",
+                     reviewed_tree_oid="OTHER", reviewed_commit_oid="c")
+
+    def test_ref_updated_phase_without_candidate_commit_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(checkpoint_phase="ref_updated", candidate_tree_oid="t")
+
+    def test_reviewed_phase_without_bound_pass_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(checkpoint_phase="reviewed", candidate_tree_oid="t", candidate_commit_oid="c",
+                     verified_tree_oid="t", verified_commit_oid="c")
+
+    def test_run_target_ref_main_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(run_target_ref="refs/heads/main")
+
+    def test_checkpoint_target_ne_run_target_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(run_target_ref="refs/heads/feature-a",
+                     checkpoint_target_ref="refs/heads/feature-b")
+
+    def test_active_phase_with_protected_checkpoint_target_rejected(self):
+        with self.assertRaises(pydantic.ValidationError):
+            self._ok(checkpoint_phase="candidate_frozen", candidate_tree_oid="t",
+                     candidate_commit_oid="c", checkpoint_target_ref="refs/heads/master")
+
+    def test_matching_run_and_checkpoint_target_ok(self):
+        self._ok(run_target_ref="refs/heads/feat", checkpoint_target_ref="refs/heads/feat")
+
+    def test_round_trips_through_json(self):
+        s = _state(checkpoint_phase="reviewed", candidate_tree_oid="t", candidate_commit_oid="c",
+                   verified_tree_oid="t", verified_commit_oid="c",
+                   reviewed_tree_oid="t", reviewed_commit_oid="c")
+        back = HarnessState.model_validate(s.model_dump(mode="json"))
+        self.assertEqual(back.reviewed_commit_oid, "c")
+
+    def test_clear_candidate_evidence_resets_all(self):
+        s = _state(checkpoint_phase="reviewed", candidate_tree_oid="t", candidate_commit_oid="c",
+                   verified_tree_oid="t", verified_commit_oid="c",
+                   reviewed_tree_oid="t", reviewed_commit_oid="c",
+                   checks_passed=True, review_status="pass")
+        clear_candidate_evidence(s)
+        self.assertEqual(s.checkpoint_phase, "none")
+        self.assertIsNone(s.candidate_commit_oid)
+        self.assertIsNone(s.reviewed_commit_oid)
+        self.assertIsNone(s.checks_passed)
+
+
 class StagnationTests(unittest.TestCase):
     def _failing(self):
         return _state(check_results=[CheckResult(command="c", exit_code=1, stderr_tail="same")])
 
     def test_accumulates_when_failure_and_diff_unchanged(self):
         s = self._failing()
-        update_stagnation(s, new_diff_hash="h1")   # first failing pass
+        update_stagnation(s, candidate_tree_oid="h1")   # first failing pass
         self.assertEqual(s.stagnant_iterations, 0)
         s.check_results = [CheckResult(command="c", exit_code=1, stderr_tail="same")]
-        update_stagnation(s, new_diff_hash="h1")   # identical again
+        update_stagnation(s, candidate_tree_oid="h1")   # identical again
         self.assertEqual(s.stagnant_iterations, 1)
         s.check_results = [CheckResult(command="c", exit_code=1, stderr_tail="same")]
-        update_stagnation(s, new_diff_hash="h1")
+        update_stagnation(s, candidate_tree_oid="h1")
         self.assertEqual(s.stagnant_iterations, 2)
         self.assertTrue(is_stagnant(s, max_stagnant=2))
 
     def test_resets_when_diff_moves(self):
         s = self._failing()
-        update_stagnation(s, new_diff_hash="h1")
+        update_stagnation(s, candidate_tree_oid="h1")
         s.check_results = [CheckResult(command="c", exit_code=1, stderr_tail="same")]
-        update_stagnation(s, new_diff_hash="h1")
+        update_stagnation(s, candidate_tree_oid="h1")
         self.assertEqual(s.stagnant_iterations, 1)
         s.check_results = [CheckResult(command="c", exit_code=1, stderr_tail="same")]
-        update_stagnation(s, new_diff_hash="h2")   # diff changed
+        update_stagnation(s, candidate_tree_oid="h2")   # diff changed
         self.assertEqual(s.stagnant_iterations, 0)
 
     def test_resets_when_checks_pass(self):
         s = self._failing()
-        update_stagnation(s, new_diff_hash="h1")
+        update_stagnation(s, candidate_tree_oid="h1")
         s.check_results = [CheckResult(command="c", exit_code=0)]
-        update_stagnation(s, new_diff_hash="h1")
+        update_stagnation(s, candidate_tree_oid="h1")
         self.assertEqual(s.stagnant_iterations, 0)
         self.assertEqual(s.repeated_failure_count, 0)
 

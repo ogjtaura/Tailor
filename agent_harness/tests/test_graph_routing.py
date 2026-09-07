@@ -89,27 +89,32 @@ class VerifyRepairRoutingTests(RoutingScenarioBase):
         self.assertEqual(final.stop_reason, StopReason.SUCCESS)
 
 
+STATIC_BROKEN = lambda self: (lambda _r: self.git.write("src/x.py", "broken but non-empty"))
+
+
 class CheckpointTests(RoutingScenarioBase):
-    def test_happy_path_commits_once(self):
+    def test_happy_path_advances_ref_once(self):
         eng = self.build()
         final = self.run_engine(eng, checks(True))
-        self.assertEqual(len(self.git.checkpoints), 1)
+        self.assertEqual(len(self.git.cas_calls), 1)                # exactly one CAS
         self.assertEqual(len(final.commits), 1)
-        self.assertIn("do the thing", self.git.checkpoints[0]["message"])
+        self.assertEqual(final.commits[0], self.git.resolve_ref(self.git._head_ref))
         self.assertEqual(final.completed_tasks, ["do the thing"])
+        self.assertIn("freeze", self.printer.visited)
         self.assertEqual(final.stop_reason, StopReason.SUCCESS)
 
 
 class StagnationTests(RoutingScenarioBase):
     def test_repeated_identical_failure_escalates_then_gives_up(self):
-        # on_edit does NOT change the diff -> fingerprint + diff hash stay constant
+        # writer keeps producing the SAME non-empty failing change -> candidate
+        # tree OID is constant -> stagnation accrues
         eng = self.build(agent={"max_iterations": 20, "max_repairs_per_task": 6,
                                 "max_stagnant_iterations": 2},
-                         claude=FakeClaude(plan_result=one_task_plan(), on_edit=lambda _r: None))
+                         claude=FakeClaude(plan_result=one_task_plan(),
+                                           on_edit=lambda _r: self.git.write("src/x.py", "same")))
         final = self.run_engine(eng, checks(False))
         self.assertIn("escalation_review", self.printer.visited)
         self.assertIn("escalate", self.codex.calls)
-        # P2: STAGNATION_UNRESOLVED is now wired (escalation did not break the loop)
         self.assertEqual(final.stop_reason, StopReason.STAGNATION_UNRESOLVED)
 
 
@@ -117,10 +122,19 @@ class LimitTests(RoutingScenarioBase):
     def test_iteration_limit_stops_before_next_repair(self):
         eng = self.build(agent={"max_iterations": 2, "max_repairs_per_task": 10,
                                 "max_stagnant_iterations": 9},
-                         claude=FakeClaude(plan_result=one_task_plan(), on_edit=lambda _r: None))
+                         claude=FakeClaude(plan_result=one_task_plan(),
+                                           on_edit=lambda _r: self.git.write("src/x.py", "same")))
         final = self.run_engine(eng, checks(False))
         self.assertEqual(final.stop_reason, StopReason.ITERATION_LIMIT)
         self.assertEqual(final.iteration, 2)
+
+    def test_noop_writer_reaches_no_progress(self):
+        eng = self.build(agent={"max_iterations": 20, "max_repairs_per_task": 2},
+                         claude=FakeClaude(plan_result=one_task_plan(), on_edit=lambda _r: None))
+        final = self.run_engine(eng, checks(True))
+        self.assertEqual(final.stop_reason, StopReason.NO_PROGRESS)
+        self.assertEqual(final.completed_tasks, [])
+        self.assertEqual(self.git.cas_calls, [])
 
     def test_dirty_worktree_refuses_to_start(self):
         eng = self.build(git_clean=False)
@@ -138,7 +152,7 @@ class LimitTests(RoutingScenarioBase):
         self.assertEqual(final.stop_reason, StopReason.PROTECTED_PATH_MODIFIED)
         self.assertNotIn("repair", self.printer.visited)
         self.assertNotIn("verify", self.printer.visited)
-        self.assertEqual(self.git.checkpoints, [])
+        self.assertEqual(self.git.cas_calls, [])
 
 
 class ReviewerInfraTests(RoutingScenarioBase):
@@ -174,7 +188,8 @@ class UsageLimitPropagationTests(RoutingScenarioBase):
         from agent_harness.workers.codex import EscalateOutcome
         eng = self.build(
             agent={"max_iterations": 20, "max_repairs_per_task": 9, "max_stagnant_iterations": 1},
-            claude=FakeClaude(plan_result=one_task_plan(), on_edit=lambda _r: None),
+            claude=FakeClaude(plan_result=one_task_plan(),
+                              on_edit=lambda _r: self.git.write("src/x.py", "same")),
             codex=FakeCodex(escalate_result=EscalateOutcome(root_cause=None,
                                                             classification="usage_limit")),
         )
@@ -228,10 +243,14 @@ class DecideBoundaryTests(unittest.TestCase):
     def test_final_iteration_still_reviews_and_checkpoints(self):
         eng = self._engine(3)
         s = base_state(iteration=3, checks_passed=True, review_status="pending",
-                       owned_paths=["src/x.py"], reviewed_paths=["src/x.py"])
+                       owned_paths=["src/x.py"], candidate_commit_oid="c1",
+                       candidate_tree_oid="t1", verified_tree_oid="t1",
+                       checkpoint_phase="verified")
         self.assertEqual(eng._decide_route(s), "review")
         self.assertIsNone(s.stop_reason)
         s.review_status = "pass"
+        s.reviewed_tree_oid = "t1"
+        s.checkpoint_phase = "reviewed"
         self.assertEqual(eng._decide_route(s), "checkpoint")
         self.assertIsNone(s.stop_reason)
 

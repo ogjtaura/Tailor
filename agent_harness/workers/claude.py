@@ -53,6 +53,9 @@ class PlanResult(BaseModel):
     tasks: list[PlanTask]
 
 
+_USAGE_LIMIT_SUBTYPES = ("usage_limit", "rate_limit", "quota", "overloaded")
+
+
 @dataclass
 class ClaudeInvocation:
     role: str
@@ -60,17 +63,27 @@ class ClaudeInvocation:
     result_text: str = ""
     is_error: bool = False
     subtype: str = ""
+    parsed: bool = True          # was the structured JSON response parseable?
     num_turns: int | None = None
     total_cost_usd: float | None = None
     session_id: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.result.ok and not self.is_error
+        """A write-capable invocation succeeded only if the subprocess is clean
+        AND the structured response parsed AND it did not report is_error."""
+        return self.result.ok and self.parsed and not self.is_error
 
     @property
     def classification(self) -> str:
         return self.result.classification
+
+    @property
+    def is_usage_limit(self) -> bool:
+        if self.result.classification == "usage_limit":
+            return True
+        st = (self.subtype or "").lower()
+        return any(k in st for k in _USAGE_LIMIT_SUBTYPES)
 
 
 def _parse_cli_json(stdout: str) -> dict:
@@ -132,12 +145,13 @@ class ClaudeWorker:
         ]
         argv += self._maybe_max_turns(self.config.claude.planner_max_turns)
         inv = self._run(argv, role="plan", iteration=iteration)
-        if inv.classification == "usage_limit":
+        if inv.is_usage_limit:
             raise WorkerUsageLimitError("planner hit a usage/rate limit")
         if not inv.ok:
             raise PlanningError(
                 f"planner CLI failed (exit={inv.result.exit_code}, "
-                f"class={inv.classification}): {inv.result.stderr[:400]}"
+                f"class={inv.classification}, is_error={inv.is_error}, "
+                f"parsed={inv.parsed}, subtype={inv.subtype!r}): {inv.result.stderr[:400]}"
             )
         return _validate_plan(inv.result_text)
 
@@ -205,15 +219,19 @@ class ClaudeWorker:
             usage_limit_patterns=self.config.classify.usage_limit_patterns,
         )
         data = _parse_cli_json(res.stdout)
+        # `claude -p --output-format json` always emits a populated object; if we
+        # could not parse one, the invocation cannot be trusted as a success
+        # even when the subprocess exited 0.
         return ClaudeInvocation(
             role=role,
             result=res,
             result_text=str(data.get("result", "")) if data else res.stdout,
-            is_error=bool(data.get("is_error", False)),
-            subtype=str(data.get("subtype", "")),
-            num_turns=data.get("num_turns"),
-            total_cost_usd=data.get("total_cost_usd"),
-            session_id=str(data.get("session_id", "")),
+            is_error=bool(data.get("is_error", False)) if data else False,
+            subtype=str(data.get("subtype", "")) if data else "",
+            parsed=bool(data),
+            num_turns=data.get("num_turns") if data else None,
+            total_cost_usd=data.get("total_cost_usd") if data else None,
+            session_id=str(data.get("session_id", "")) if data else "",
         )
 
 

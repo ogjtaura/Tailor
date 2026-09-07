@@ -115,16 +115,21 @@ def run_subprocess(
         )
 
     if log_path is not None:
+        # Run logs can contain prompts, diffs, model output and source
+        # fragments (never credentials - the child env is scrubbed). Create them
+        # user-only.
         try:
             p = Path(log_path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                f"$ {' '.join(argv)}\n"
-                f"# cwd={cwd}\n# exit={exit_code} timed_out={timed_out} "
-                f"duration={duration:.1f}s classification={classification}\n\n"
-                f"----- stdout -----\n{_tail(stdout)}\n\n"
-                f"----- stderr -----\n{_tail(stderr)}\n"
-            )
+            fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(
+                    f"$ {' '.join(argv)}\n"
+                    f"# cwd={cwd}\n# exit={exit_code} timed_out={timed_out} "
+                    f"duration={duration:.1f}s classification={classification}\n\n"
+                    f"----- stdout -----\n{_tail(stdout)}\n\n"
+                    f"----- stderr -----\n{_tail(stderr)}\n"
+                )
         except OSError:
             pass
 

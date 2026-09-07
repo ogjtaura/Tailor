@@ -14,7 +14,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 REPO_ROOT_ENV = "AGENT_HARNESS_REPO_ROOT"
 
@@ -34,12 +34,14 @@ class ConfigError(RuntimeError):
 
 
 class AgentSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     max_iterations: int = 15
     max_repairs_per_task: int = 5
     max_stagnant_iterations: int = 3
 
 
 class ClaudeSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     model: str = "claude-sonnet-5"
     executable: str = ""
     timeout_seconds: int = 1800
@@ -53,6 +55,7 @@ class ClaudeSection(BaseModel):
 
 
 class CodexSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     review_model: str = "gpt-5.6-luna"
     checkpoint_model: str = "gpt-5.6-terra"
     executable: str = ""
@@ -61,22 +64,26 @@ class CodexSection(BaseModel):
 
 
 class GitSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     auto_commit: bool = True
     branch_required: bool = True
     require_clean_worktree: bool = True
 
 
 class SafetySection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     protected_paths: list[str] = Field(
         default_factory=lambda: ["agent_harness/", "agent.toml", ".git/", ".agent/"]
     )
 
 
 class ChecksSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     commands: list[str] = Field(default_factory=list)
 
 
 class ClassifySection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     usage_limit_patterns: list[str] = Field(
         default_factory=lambda: [
             "usage limit",
@@ -90,6 +97,7 @@ class ClassifySection(BaseModel):
 
 
 class Config(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     agent: AgentSection = Field(default_factory=AgentSection)
     claude: ClaudeSection = Field(default_factory=ClaudeSection)
     codex: CodexSection = Field(default_factory=CodexSection)
