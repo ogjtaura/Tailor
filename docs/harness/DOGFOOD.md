@@ -79,3 +79,46 @@ Record:
 - human interventions
 - stop reason
 - post-checkpoint defects
+
+## V1-001 telemetry baseline
+
+Attempts 1-3:
+
+| Metric | Value |
+|---|---:|
+| Total model invocations | 28 |
+| Claude invocations | 18 |
+| Luna reviews | 10 |
+| Terra invocations | 0 |
+| Total model execution time | 39m 59s |
+| Claude execution time | 25m 50s |
+| Codex execution time | 14m 09s |
+| Planner calls/time | 3 / 3m 53s |
+| Implementer calls/time | 4 / 1m 47s |
+| Repairer calls/time | 11 / 20m 11s |
+| Luna calls/time | 10 / 14m 09s |
+
+### Primary conclusion
+
+Repair/review churn, rather than initial implementation, is the dominant
+intelligence cost.
+
+A conservative retrospective estimate suggests that scope-aware early stopping,
+SPEC_REQUIRED handling, and no-op task detection could have avoided about
+11/28 model calls (~39%) and ~18m26s of model execution (~46%) across attempts
+2-3 without weakening final acceptance gates.
+
+Including the spec-first lesson from attempt 1 raises the retrospective ideal
+to roughly 19/28 calls (~68%) and ~29m15s (~73%), though this should be treated
+as an upper-bound retrospective estimate rather than an expected immediate
+V1.1 result.
+
+### Priority implications
+
+1. out-of-scope reviewer finding stop
+2. reviewer finding fingerprinting
+3. SPEC_REQUIRED
+4. no-op/already-satisfied handling
+5. structured repair packets
+6. bounded Luna review packets
+7. planner skipping for precise tasks
