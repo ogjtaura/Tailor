@@ -20,7 +20,12 @@ import argparse, json, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-from verifier import verify_output, verify_protected_fields, coverage_report
+from verifier import (
+    verify_output,
+    verify_protected_fields,
+    coverage_report,
+    validate_applicant_identity,
+)
 
 BOLD, RED, YEL, GRN, DIM, OFF = "\033[1m", "\033[31m", "\033[33m", "\033[32m", "\033[2m", "\033[0m"
 
@@ -47,6 +52,11 @@ def main():
     reqs = load(a.reqs or out["_reqs_path"]) if (a.reqs or out.get("_reqs_path")) else None
 
     failures = []
+    if "objects" in out:
+        # Documented wrapper: applicant_id sits once on the top-level object and
+        # is not repeated on the nested CV/COVER documents. Bind it here before
+        # descending, so a missing/blank/incorrect wrapper identity cannot pass.
+        failures += validate_applicant_identity(bank, out)
     for obj in out.get("objects", [out]):
         failures += verify_output(bank, obj)
     if out.get("protected_fields_produced"):

@@ -98,6 +98,35 @@ def verify_protected_fields(bank: Dict[str, Any], produced: Dict[str, Any]) -> L
     return failures
 
 
+def validate_applicant_identity(bank: Dict[str, Any], wrapper: Dict[str, Any]) -> List[Failure]:
+    """Check the top-level application wrapper carries the right applicant_id.
+
+    The documented machine-readable format places applicant_id once on the
+    wrapper object; nested CV/COVER document objects do not repeat it. When the
+    canonical bank has a non-empty applicant_id this gate is mandatory:
+
+      - a missing or blank wrapper applicant_id -> APPLICANT_MISSING (error)
+      - a present but incorrect value           -> APPLICANT_MISMATCH (error)
+      - the correct value                       -> no failures
+
+    When the bank has no applicant_id there is nothing to bind to, so this
+    returns no failures.
+    """
+    canonical = str(bank.get("applicant_id") or "").strip()
+    if not canonical:
+        return []
+
+    raw = wrapper.get("applicant_id")
+    value = raw.strip() if isinstance(raw, str) else ("" if raw is None else str(raw).strip())
+    if not value:
+        return [Failure("APPLICANT_MISSING",
+            f"Wrapper is missing a top-level applicant_id; bank is {canonical}")]
+    if value != canonical:
+        return [Failure("APPLICANT_MISMATCH",
+            f"Wrapper is for {value}, bank is {canonical}")]
+    return []
+
+
 def verify_output(bank: Dict[str, Any], output_obj: Dict[str, Any]) -> List[Failure]:
     failures: List[Failure] = []
     facts, sources = _fact_index(bank), _source_ids(bank)
