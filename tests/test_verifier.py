@@ -114,6 +114,23 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
         self.assertIn("APPLICANT_MISMATCH", result.stdout)
 
+    def test_wrapper_objects_must_be_a_list(self):
+        output = self._documented_wrapper()
+        output["objects"] = {
+            "object_id": "CV",
+            "text": "Malformed nested document.",
+            "claims": [],
+        }
+
+        result = self._run_check(output)
+
+        self.assertEqual(
+            result.returncode,
+            1,
+            msg=result.stdout + result.stderr,
+        )
+        self.assertIn("INVALID_OBJECTS", result.stdout)
+
     def test_exact_protected_field_passes(self):
         failures = verify_protected_fields(
             self.bank, {"employment.f1.job_title": "Quality Shift Intern"}
