@@ -12,7 +12,10 @@ from verifier import verify_output, verify_protected_fields, coverage_report
 class VerifierTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.bank = json.loads((ROOT / "applicants" / "jt" / "fact_bank.json").read_text())
+        # Synthetic, tracked fixture: the deterministic suite must depend only on
+        # files committed to Git (the harness verifies an immutable candidate in a
+        # temp checkout where gitignored local files are absent).
+        cls.bank = json.loads((ROOT / "tests" / "fixtures" / "fact_bank.json").read_text())
         cls.cases = json.loads((ROOT / "tests" / "adversarial_cases.json").read_text())
 
     def test_adversarial_cases(self):

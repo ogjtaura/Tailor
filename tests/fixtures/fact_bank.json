@@ -1,0 +1,77 @@
+{
+  "_comment": "Synthetic, tracked fixture for tests/test_verifier.py. Contains only the minimum facts / fields the deterministic verifier tests exercise. No personal data. Fact ids and the employment.f1.job_title path are the identifiers the tests reference explicitly; facts are ordered so index 3 is FACT-FONTERRA-180 (used by test_superseded_fact_cannot_be_cited).",
+  "applicant_id": "APPLICANT-TEST-001",
+  "sources": [
+    {
+      "source_id": "SRC-BRIEF-TEST",
+      "source_type": "document",
+      "name": "Team project brief",
+      "notes": "Team-level project source"
+    },
+    {
+      "source_id": "SRC-USER-TEST",
+      "source_type": "user_confirmation",
+      "name": "Applicant confirmation",
+      "notes": "Confirmed measurement"
+    },
+    {
+      "source_id": "SRC-CV-TEST",
+      "source_type": "document",
+      "name": "Applicant CV",
+      "notes": "Primary applicant source"
+    }
+  ],
+  "protected_fields": {
+    "employment": {
+      "f1": {
+        "job_title": "Quality Shift Intern"
+      }
+    }
+  },
+  "facts": [
+    {
+      "fact_id": "FACT-GWR-TEAM-7_8",
+      "source_ids": ["SRC-BRIEF-TEST"],
+      "category": "project_performance",
+      "value": "approximately 7.8 seconds",
+      "text": "The four-person team's current best development performance is approximately 7.8 seconds end-to-end.",
+      "ownership": "team",
+      "state": "development_result",
+      "confirmed_at": "2026-01-01",
+      "supersedes": null
+    },
+    {
+      "fact_id": "FACT-GWR-ATTEMPT",
+      "source_ids": ["SRC-BRIEF-TEST"],
+      "category": "project_status",
+      "value": "Guinness World Records attempt",
+      "text": "The team is preparing for an official Guinness World Records attempt.",
+      "ownership": "team",
+      "state": "planned",
+      "confirmed_at": "2026-01-01",
+      "supersedes": null
+    },
+    {
+      "fact_id": "FACT-ROTATION-28MS",
+      "source_ids": ["SRC-USER-TEST"],
+      "category": "individual_project_contribution",
+      "value": "28 ms per 90° rotation",
+      "text": "Selected and configured the motor controllers, achieving 28 ms per 90° rotation on the full system build.",
+      "ownership": "individual",
+      "state": "completed",
+      "confirmed_at": "2026-01-01",
+      "supersedes": null
+    },
+    {
+      "fact_id": "FACT-FONTERRA-180",
+      "source_ids": ["SRC-CV-TEST"],
+      "category": "work_achievement",
+      "value": "over 180 filters",
+      "text": "Investigated filtration systems and identified and catalogued over 180 filters.",
+      "ownership": "individual",
+      "state": "completed",
+      "confirmed_at": "2026-01-01",
+      "supersedes": null
+    }
+  ]
+}
