@@ -1,5 +1,7 @@
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -40,53 +42,77 @@ class VerifierTests(unittest.TestCase):
                 for code in case.get("expected_codes", []):
                     self.assertTrue(any(f.code == code for f in failures), msg=[f.code for f in failures])
 
-    def test_missing_applicant_id_fails(self):
-        output = {
-            "object_id": "ID-MISSING",
-            "claims": [],
-        }
-        failures = verify_output(self.bank, output)
-        self.assertTrue(any(
-            f.code == "APPLICANT_MISSING" and f.severity == "error"
-            for f in failures
-        ), msg=[f.code for f in failures])
+    def _run_check(self, output):
+        """Exercise the real check.py entry point with the documented wrapper."""
+        with tempfile.TemporaryDirectory() as d:
+            output_path = Path(d) / "output.json"
+            output_path.write_text(json.dumps(output))
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "check.py"),
+                    "--bank",
+                    str(ROOT / "tests" / "fixtures" / "fact_bank.json"),
+                    "--output",
+                    str(output_path),
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
-    def test_blank_applicant_id_fails(self):
-        output = {
-            "object_id": "ID-BLANK",
-            "applicant_id": "",
-            "claims": [],
-        }
-        failures = verify_output(self.bank, output)
-        self.assertTrue(any(
-            f.code == "APPLICANT_MISSING" and f.severity == "error"
-            for f in failures
-        ), msg=[f.code for f in failures])
-
-    def test_wrong_applicant_id_fails_with_mismatch(self):
-        output = {
-            "object_id": "ID-WRONG",
-            "applicant_id": "SOMEONE-ELSE",
-            "claims": [],
-        }
-        failures = verify_output(self.bank, output)
-        self.assertTrue(any(
-            f.code == "APPLICANT_MISMATCH" and f.severity == "error"
-            for f in failures
-        ), msg=[f.code for f in failures])
-        self.assertFalse(any(
-            f.code == "APPLICANT_MISSING"
-            for f in failures
-        ), msg=[f.code for f in failures])
-
-    def test_correct_applicant_id_passes_identity_gate(self):
-        output = {
-            "object_id": "ID-CORRECT",
+    def _documented_wrapper(self):
+        return {
             "applicant_id": self.bank["applicant_id"],
-            "claims": [],
+            "objects": [
+                {
+                    "object_id": "CV",
+                    "text": "Example CV body.",
+                    "claims": [],
+                },
+                {
+                    "object_id": "COVER",
+                    "text": "Example cover letter.",
+                    "claims": [],
+                },
+            ],
         }
-        failures = verify_output(self.bank, output)
-        self.assertEqual(failures, [])
+
+    def test_documented_wrapper_with_correct_applicant_id_passes(self):
+        result = self._run_check(self._documented_wrapper())
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=result.stdout + result.stderr,
+        )
+
+    def test_documented_wrapper_missing_applicant_id_fails(self):
+        output = self._documented_wrapper()
+        del output["applicant_id"]
+
+        result = self._run_check(output)
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("APPLICANT_MISSING", result.stdout)
+
+    def test_documented_wrapper_blank_applicant_id_fails(self):
+        output = self._documented_wrapper()
+        output["applicant_id"] = "   "
+
+        result = self._run_check(output)
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("APPLICANT_MISSING", result.stdout)
+
+    def test_documented_wrapper_wrong_applicant_id_fails(self):
+        output = self._documented_wrapper()
+        output["applicant_id"] = "SOMEONE-ELSE"
+
+        result = self._run_check(output)
+
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("APPLICANT_MISMATCH", result.stdout)
 
     def test_exact_protected_field_passes(self):
         failures = verify_protected_fields(
@@ -104,7 +130,6 @@ class VerifierTests(unittest.TestCase):
         text = "word " * 201
         output = {
             "object_id": "Q1",
-            "applicant_id": self.bank["applicant_id"],
             "text": text,
             "word_limit": 200,
             "claims": []
@@ -121,7 +146,6 @@ class VerifierTests(unittest.TestCase):
 
         output = {
             "object_id": "CV",
-            "applicant_id": self.bank["applicant_id"],
             "text": "Catalogued over 180 filters.",
             "claims": [{
                 "claim_id": "C1",
